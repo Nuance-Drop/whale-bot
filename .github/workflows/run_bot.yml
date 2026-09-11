@@ -2,11 +2,9 @@ name: Run Whale Bot
 
 on:
   schedule:
-    # Runs every 30 minutes during US market hours (Mon-Fri)
-    # 14:30-21:00 UTC = 9:30 AM - 4:00 PM ET (with DST buffer)
     - cron: '0,30 14-20 * * 1-5'
     - cron: '0 21 * * 1-5'
-  workflow_dispatch:  # Allows manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -36,6 +34,8 @@ jobs:
           APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
           FORM4API_KEY: ${{ secrets.FORM4API_KEY }}
           BARGO_API_KEY: ${{ secrets.BARGO_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
 
       - name: Upload bot log
