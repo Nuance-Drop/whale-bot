@@ -1,5 +1,5 @@
 """
-Whale Bot v5 - Multi-Signal Confluence Engine with Dynamic Threshold
+Whale Bot v5 - Multi-Signal Confluence Engine with Dynamic Threshold + Telegram Alerts
 Combines: Congressional Trades + Insider Trades + PEAD + Options Flow + RSI/SMA + Sentiment
 """
 
@@ -21,13 +21,15 @@ import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ============================================================
-# API KEYS (set these as GitHub Secrets)
+# API KEYS
 # ============================================================
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 APIFY_API_KEY = os.environ.get("APIFY_API_KEY")
 FORM4API_KEY = os.environ.get("FORM4API_KEY")
 BARGO_API_KEY = os.environ.get("BARGO_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # ============================================================
 # CONFIGURATION
@@ -38,7 +40,7 @@ STOP_LOSS_PCT = 0.025
 TRAIL_PCT = 0.015
 MAX_POSITIONS = 3
 TACTICAL_LIMIT_PCT = 0.20
-MIN_SIGNAL_SCORE = 4  # Base threshold, adjusted dynamically
+MIN_SIGNAL_SCORE = 4
 
 LOG_FILE = "trade_log.csv"
 BOT_LOG = "bot.log"
@@ -49,6 +51,23 @@ logging.basicConfig(filename=BOT_LOG, level=logging.INFO,
 def log(msg):
     print(msg)
     logging.info(msg)
+
+# ============================================================
+# TELEGRAM NOTIFICATIONS
+# ============================================================
+def send_telegram(message):
+    """Send a Telegram message. Never crashes the bot if it fails."""
+    try:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+    except Exception as e:
+        log(f"⚠️ Telegram failed: {e}")
 
 # ============================================================
 # MARKET REGIME
@@ -65,11 +84,9 @@ def is_market_bullish():
 # SIGNAL 1: CONGRESSIONAL TRADES (Bargo Congress - Free)
 # ============================================================
 def congressional_signal(symbol):
-    """Returns True if Congress bought this ticker in last 30 days."""
     try:
         if not BARGO_API_KEY:
             return False
-        # Bargo Congress Trades API - free tier
         url = "https://www.bargo.ai/free-apis/congress/v1/trades"
         headers = {"X-Api-Key": BARGO_API_KEY}
         params = {
@@ -82,8 +99,7 @@ def congressional_signal(symbol):
         if r.status_code != 200:
             return False
         data = r.json()
-        trades = data.get("trades", [])
-        return len(trades) > 0
+        return len(data.get("trades", [])) > 0
     except Exception as e:
         log(f"⚠️ Congressional signal error: {e}")
         return False
@@ -92,11 +108,9 @@ def congressional_signal(symbol):
 # SIGNAL 2: INSIDER TRADES (Form4API - Free)
 # ============================================================
 def insider_signal(symbol):
-    """Returns True if insiders bought this ticker in last 30 days."""
     try:
         if not FORM4API_KEY:
             return False
-        # Form4API endpoint
         url = f"https://api.form4api.com/v1/insider/trades/{symbol}"
         headers = {"Authorization": f"Bearer {FORM4API_KEY}"}
         r = requests.get(url, headers=headers, timeout=15)
@@ -114,10 +128,9 @@ def insider_signal(symbol):
         return False
 
 # ============================================================
-# SIGNAL 3: PEAD (Post-Earnings Announcement Drift)
+# SIGNAL 3: PEAD
 # ============================================================
 def pead_signal(symbol):
-    """Returns True if there was a recent earnings beat (last 30 days)."""
     try:
         ticker = yf.Ticker(symbol)
         earnings = ticker.earnings_dates
@@ -140,18 +153,16 @@ def pead_signal(symbol):
         return False
 
 # ============================================================
-# SIGNAL 4: OPTIONS FLOW (GammaRips MCP)
+# SIGNAL 4: OPTIONS FLOW
 # ============================================================
 def options_flow_signal(symbol):
-    """Returns True if whale call buying detected via GammaRips."""
     try:
         url = "https://mcp.gammarips.com/mcp"
         r = requests.post(url, json={"method": "get_daily_report"}, timeout=10)
         if r.status_code != 200:
             return False
         data = r.json()
-        pool = data.get('bullish_pool', [])
-        for item in pool:
+        for item in data.get('bullish_pool', []):
             if item.get('symbol') == symbol:
                 return True
         return False
@@ -160,10 +171,9 @@ def options_flow_signal(symbol):
         return False
 
 # ============================================================
-# SIGNAL 5: TECHNICAL (RSI + SMA50)
+# SIGNAL 5: TECHNICAL
 # ============================================================
 def technical_signal(symbol):
-    """Returns (rsi_ok, sma_ok) tuple."""
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="3mo", interval="1d", auto_adjust=True)
@@ -173,8 +183,7 @@ def technical_signal(symbol):
         delta = df['Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
+        df['RSI'] = 100 - (100 / (1 + gain/loss))
         last = df.iloc[-1]
         rsi_ok = 35 < last['RSI'] < 55
         sma_ok = last['Close'] > last['SMA50']
@@ -205,49 +214,33 @@ def sentiment_signal(symbol):
         return False
 
 # ============================================================
-# COMPOSITE SCORING ENGINE
+# COMPOSITE SCORING
 # ============================================================
 def calculate_score(symbol):
-    """Returns total score (0-10) and signal breakdown."""
     score = 0
     signals = {}
-    
-    # Regime (required, +1)
     if not is_market_bullish():
         return 0, {"regime": False}
     score += 1
     signals['regime'] = True
-    
-    # Technical (+2 max)
     rsi_ok, sma_ok = technical_signal(symbol)
     if rsi_ok: score += 1; signals['rsi'] = True
     if sma_ok: score += 1; signals['sma'] = True
-    
-    # Sentiment (+1)
     if sentiment_signal(symbol):
         score += 1; signals['sentiment'] = True
-    
-    # Congressional (+2)
     if congressional_signal(symbol):
         score += 2; signals['congress'] = True
-    
-    # Insider (+2)
     if insider_signal(symbol):
         score += 2; signals['insider'] = True
-    
-    # PEAD (+1)
     if pead_signal(symbol):
         score += 1; signals['pead'] = True
-    
-    # Options Flow (+2)
     if options_flow_signal(symbol):
         score += 2; signals['flow'] = True
-    
     log(f"  {symbol} SCORE: {score}/10 | Signals: {signals}")
     return score, signals
 
 # ============================================================
-# DYNAMIC THRESHOLD ENGINE
+# DYNAMIC THRESHOLD
 # ============================================================
 def get_vix_level():
     try:
@@ -283,55 +276,47 @@ def is_macro_event_week():
 def calculate_dynamic_threshold(equity, num_positions, log):
     threshold = 4
     reasons = []
-
     regime_strength = get_spy_regime_strength()
     if regime_strength < 0:
         log(f"  🚫 SPY below 200MA ({regime_strength:.1f}%) — BLOCK ALL TRADES")
         return 999, ["regime_block"]
     elif regime_strength < 2:
         threshold += 1
-        reasons.append(f"Fragile regime (+1, SPY only +{regime_strength:.1f}% above 200MA)")
+        reasons.append(f"Fragile regime (+1, SPY only +{regime_strength:.1f}%)")
     elif regime_strength > 5:
         threshold -= 1
         reasons.append(f"Strong bull (-1, SPY +{regime_strength:.1f}%)")
-
     vix = get_vix_level()
     if vix > 30:
         threshold += 2
-        reasons.append(f"VIX {vix:.1f} > 30 (+2, high fear)")
+        reasons.append(f"VIX {vix:.1f} > 30 (+2)")
     elif vix > 20:
         threshold += 1
         reasons.append(f"VIX {vix:.1f} elevated (+1)")
     elif vix < 15:
         threshold -= 1
-        reasons.append(f"VIX {vix:.1f} < 15 (-1, complacent)")
-
+        reasons.append(f"VIX {vix:.1f} < 15 (-1)")
     if is_earnings_season():
         threshold += 1
         reasons.append("Earnings season (+1)")
-
     if is_macro_event_week():
         threshold += 1
         reasons.append("Macro event week (+1)")
-
     if num_positions >= 2:
         threshold += 1
-        reasons.append(f"Already holding {num_positions} positions (+1)")
-
+        reasons.append(f"Holding {num_positions} positions (+1)")
     now = datetime.now(timezone.utc)
-    hour = now.hour
-    if now.weekday() == 0 and hour < 16:
+    if now.weekday() == 0 and now.hour < 16:
         threshold += 1
         reasons.append("Monday morning (+1)")
-    if now.weekday() == 4 and hour >= 19:
+    if now.weekday() == 4 and now.hour >= 19:
         threshold += 1
         reasons.append("Friday afternoon (+1)")
-
     threshold = max(3, min(threshold, 10))
     return threshold, reasons
 
 # ============================================================
-# POSITION SIZING SCALER
+# POSITION SIZING
 # ============================================================
 def calculate_position_multiplier(score, threshold):
     if score <= threshold:
@@ -361,7 +346,7 @@ def log_trade(symbol, side, qty, price, stop, target):
     except Exception as e:
         log(f"⚠️ Log error: {e}")
 
-def place_bracket_order(symbol, side, qty, entry_price):
+def place_bracket_order(symbol, side, qty, entry_price, score, threshold):
     try:
         stop_price = round(entry_price * (1 - STOP_LOSS_PCT), 2)
         target_price = round(entry_price * (1 + 0.05), 2)
@@ -375,9 +360,25 @@ def place_bracket_order(symbol, side, qty, entry_price):
         order = client.submit_order(order_data)
         log(f"✅ {side} {qty} {symbol} @ ${entry_price:.2f} | SL: ${stop_price} | TP: ${target_price}")
         log_trade(symbol, str(side), qty, entry_price, stop_price, target_price)
+
+        # Telegram alert for the trade
+        alert = (
+            f"🚨 *TRADE PLACED*\n\n"
+            f"*Symbol:* {symbol}\n"
+            f"*Side:* BUY\n"
+            f"*Quantity:* {qty} shares\n"
+            f"*Entry:* ${entry_price:.2f}\n"
+            f"*Stop-Loss:* ${stop_price}\n"
+            f"*Target:* ${target_price}\n"
+            f"*Score:* {score}/{threshold}\n"
+            f"*Cost:* ${qty * entry_price:.2f}\n\n"
+            f"Equity: ${float(client.get_account().equity):.2f}"
+        )
+        send_telegram(alert)
         return order
     except Exception as e:
         log(f"❌ Order failed: {e}")
+        send_telegram(f"❌ *Order failed* for {symbol}: {e}")
         return None
 
 # ============================================================
@@ -397,12 +398,10 @@ def run_bot():
         equity = float(account.equity)
         open_positions = client.get_all_positions()
         position_symbols = [p.symbol for p in open_positions]
-
         orders_request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
         open_orders = client.get_orders(filter=orders_request)
         order_symbols = [o.symbol for o in open_orders]
         already_held = set(position_symbols + order_symbols)
-
         total_position_value = sum([float(p.market_value) for p in open_positions])
         tactical_limit = equity * TACTICAL_LIMIT_PCT
 
@@ -416,7 +415,6 @@ def run_bot():
         if threshold > 10:
             log("🚫 Threshold exceeds max score. No trades today.")
             return
-
         if total_position_value >= tactical_limit:
             log("⚠️ Tactical limit reached.")
             return
@@ -457,10 +455,11 @@ def run_bot():
             log(f"⚠️ Not enough room for 1 share of {symbol}.")
             return
 
-        place_bracket_order(symbol, OrderSide.BUY, qty, price)
+        place_bracket_order(symbol, OrderSide.BUY, qty, price, score, threshold)
 
     except Exception as e:
         log(f"❌ Bot error: {e}")
+        send_telegram(f"❌ *Bot error:* {e}")
 
     log("Bot cycle complete.")
     log("=" * 60)
