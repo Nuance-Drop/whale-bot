@@ -1,0 +1,6 @@
+alpaca-py
+yfinance
+pandas
+numpy
+vaderSentiment
+requests
