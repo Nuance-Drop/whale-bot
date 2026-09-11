@@ -2,14 +2,17 @@ name: Run Whale Bot
 
 on:
   schedule:
-    # Runs every 30 minutes, Mon-Fri, 14:30-21:00 UTC (market hours)
-    - cron: '30 14-21 * * 1-5'
-    - cron: '0 15-20 * * 1-5'
+    # Runs every 30 minutes during US market hours (Mon-Fri)
+    # 14:30-21:00 UTC = 9:30 AM - 4:00 PM ET (with DST buffer)
+    - cron: '0,30 14-20 * * 1-5'
+    - cron: '0 21 * * 1-5'
   workflow_dispatch:  # Allows manual trigger from the Actions tab
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -18,22 +21,29 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install alpaca-py yfinance pandas vaderSentiment
+          pip install --upgrade pip
+          pip install alpaca-py yfinance pandas numpy vaderSentiment requests
 
       - name: Run bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
+          FORM4API_KEY: ${{ secrets.FORM4API_KEY }}
+          BARGO_API_KEY: ${{ secrets.BARGO_API_KEY }}
         run: python bot.py
 
-      - name: Upload trade log
+      - name: Upload bot log
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trade-log
+          name: bot-log-${{ github.run_number }}
           path: |
-            trade_log.csv
             bot.log
+            trade_log.csv
+          retention-days: 30
+          if-no-files-found: ignore
