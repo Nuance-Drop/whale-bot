@@ -23,9 +23,8 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 # ============================================================
 # тЪая╕П REPLACE THESE WITH YOUR ACTUAL ALPACA KEYS
 # ============================================================
-API_KEY = os.environ.get("PKCJJGQWRGCJB24ZPEWVO6WICB")
-SECRET_KEY = os.environ.get("BpD5Tjc4R8mcVTR6hDL8i6AP21y9gFox6m9AYtr5xysB")
-# ============================================================
+API_KEY = os.environ.get("ALPACA_API_KEY")
+SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")# ============================================================
 # CONFIGURATION
 # ============================================================
 WATCHLIST = ["SPY", "QQQ", "AAPL", "NVDA", "MSFT"]
