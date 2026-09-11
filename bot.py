@@ -1,8 +1,255 @@
+"""
+Whale Bot v5 - Multi-Signal Confluence Engine with Dynamic Threshold
+Combines: Congressional Trades + Insider Trades + PEAD + Options Flow + RSI/SMA + Sentiment
+"""
+
+import os
+import csv
+import logging
+import requests
+from datetime import datetime, time, timezone, timedelta
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import (
+    MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
+)
+from alpaca.trading.enums import (
+    OrderSide, TimeInForce, OrderClass, QueryOrderStatus
+)
+import yfinance as yf
+import pandas as pd
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# ============================================================
+# API KEYS (set these as GitHub Secrets)
+# ============================================================
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+APIFY_API_KEY = os.environ.get("APIFY_API_KEY")
+FORM4API_KEY = os.environ.get("FORM4API_KEY")
+BARGO_API_KEY = os.environ.get("BARGO_API_KEY")
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN"]
+RISK_PER_TRADE = 0.02
+STOP_LOSS_PCT = 0.025
+TRAIL_PCT = 0.015
+MAX_POSITIONS = 3
+TACTICAL_LIMIT_PCT = 0.20
+MIN_SIGNAL_SCORE = 4  # Base threshold, adjusted dynamically
+
+LOG_FILE = "trade_log.csv"
+BOT_LOG = "bot.log"
+
+logging.basicConfig(filename=BOT_LOG, level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+def log(msg):
+    print(msg)
+    logging.info(msg)
+
+# ============================================================
+# MARKET REGIME
+# ============================================================
+def is_market_bullish():
+    spy = yf.download("SPY", period="1y", interval="1d",
+                      auto_adjust=True, progress=False)
+    if isinstance(spy.columns, pd.MultiIndex):
+        spy.columns = spy.columns.get_level_values(0)
+    spy['SMA200'] = spy['Close'].rolling(200).mean()
+    return spy['Close'].iloc[-1] > spy['SMA200'].iloc[-1]
+
+# ============================================================
+# SIGNAL 1: CONGRESSIONAL TRADES (Bargo Congress - Free)
+# ============================================================
+def congressional_signal(symbol):
+    """Returns True if Congress bought this ticker in last 30 days."""
+    try:
+        if not BARGO_API_KEY:
+            return False
+        # Bargo Congress Trades API - free tier
+        url = "https://www.bargo.ai/free-apis/congress/v1/trades"
+        headers = {"X-Api-Key": BARGO_API_KEY}
+        params = {
+            "ticker": symbol,
+            "type": "buy",
+            "fromDate": (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"),
+            "limit": 5
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        if r.status_code != 200:
+            return False
+        data = r.json()
+        trades = data.get("trades", [])
+        return len(trades) > 0
+    except Exception as e:
+        log(f"⚠️ Congressional signal error: {e}")
+        return False
+
+# ============================================================
+# SIGNAL 2: INSIDER TRADES (Form4API - Free)
+# ============================================================
+def insider_signal(symbol):
+    """Returns True if insiders bought this ticker in last 30 days."""
+    try:
+        if not FORM4API_KEY:
+            return False
+        # Form4API endpoint
+        url = f"https://api.form4api.com/v1/insider/trades/{symbol}"
+        headers = {"Authorization": f"Bearer {FORM4API_KEY}"}
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return False
+        data = r.json()
+        cutoff = datetime.now() - timedelta(days=30)
+        for trade in data.get("trades", []):
+            trade_date = pd.to_datetime(trade.get("filingDate", "2000-01-01"))
+            if trade_date > cutoff and trade.get("transactionCode") in ["P", "A"]:
+                return True
+        return False
+    except Exception as e:
+        log(f"⚠️ Insider signal error: {e}")
+        return False
+
+# ============================================================
+# SIGNAL 3: PEAD (Post-Earnings Announcement Drift)
+# ============================================================
+def pead_signal(symbol):
+    """Returns True if there was a recent earnings beat (last 30 days)."""
+    try:
+        ticker = yf.Ticker(symbol)
+        earnings = ticker.earnings_dates
+        if earnings is None or earnings.empty:
+            return False
+        for idx, row in earnings.iterrows():
+            ed = pd.Timestamp(idx).tz_localize(None)
+            if pd.Timestamp.now() - ed > pd.Timedelta(days=30):
+                continue
+            try:
+                reported = float(row.get('Reported EPS', 0))
+                estimate = float(row.get('EPS Estimate', 0))
+                if reported > estimate:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception as e:
+        log(f"⚠️ PEAD error: {e}")
+        return False
+
+# ============================================================
+# SIGNAL 4: OPTIONS FLOW (GammaRips MCP)
+# ============================================================
+def options_flow_signal(symbol):
+    """Returns True if whale call buying detected via GammaRips."""
+    try:
+        url = "https://mcp.gammarips.com/mcp"
+        r = requests.post(url, json={"method": "get_daily_report"}, timeout=10)
+        if r.status_code != 200:
+            return False
+        data = r.json()
+        pool = data.get('bullish_pool', [])
+        for item in pool:
+            if item.get('symbol') == symbol:
+                return True
+        return False
+    except Exception as e:
+        log(f"⚠️ Options flow error: {e}")
+        return False
+
+# ============================================================
+# SIGNAL 5: TECHNICAL (RSI + SMA50)
+# ============================================================
+def technical_signal(symbol):
+    """Returns (rsi_ok, sma_ok) tuple."""
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="3mo", interval="1d", auto_adjust=True)
+        if df.empty or len(df) < 50:
+            return (False, False)
+        df['SMA50'] = df['Close'].rolling(50).mean()
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        last = df.iloc[-1]
+        rsi_ok = 35 < last['RSI'] < 55
+        sma_ok = last['Close'] > last['SMA50']
+        log(f"  {symbol}: RSI={last['RSI']:.1f}, Close={last['Close']:.2f}, SMA50={last['SMA50']:.2f}")
+        return (rsi_ok, sma_ok)
+    except Exception as e:
+        log(f"⚠️ Technical error: {e}")
+        return (False, False)
+
+# ============================================================
+# SIGNAL 6: SENTIMENT
+# ============================================================
+analyzer = SentimentIntensityAnalyzer()
+
+def sentiment_signal(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        news = ticker.news
+        if not news:
+            return False
+        scores = []
+        for item in news[:5]:
+            title = item.get('title') or item.get('content', {}).get('title', '')
+            if title:
+                scores.append(analyzer.polarity_scores(title)['compound'])
+        return (sum(scores) / len(scores)) > 0.1 if scores else False
+    except Exception:
+        return False
+
+# ============================================================
+# COMPOSITE SCORING ENGINE
+# ============================================================
+def calculate_score(symbol):
+    """Returns total score (0-10) and signal breakdown."""
+    score = 0
+    signals = {}
+    
+    # Regime (required, +1)
+    if not is_market_bullish():
+        return 0, {"regime": False}
+    score += 1
+    signals['regime'] = True
+    
+    # Technical (+2 max)
+    rsi_ok, sma_ok = technical_signal(symbol)
+    if rsi_ok: score += 1; signals['rsi'] = True
+    if sma_ok: score += 1; signals['sma'] = True
+    
+    # Sentiment (+1)
+    if sentiment_signal(symbol):
+        score += 1; signals['sentiment'] = True
+    
+    # Congressional (+2)
+    if congressional_signal(symbol):
+        score += 2; signals['congress'] = True
+    
+    # Insider (+2)
+    if insider_signal(symbol):
+        score += 2; signals['insider'] = True
+    
+    # PEAD (+1)
+    if pead_signal(symbol):
+        score += 1; signals['pead'] = True
+    
+    # Options Flow (+2)
+    if options_flow_signal(symbol):
+        score += 2; signals['flow'] = True
+    
+    log(f"  {symbol} SCORE: {score}/10 | Signals: {signals}")
+    return score, signals
+
 # ============================================================
 # DYNAMIC THRESHOLD ENGINE
 # ============================================================
 def get_vix_level():
-    """Get current VIX level."""
     try:
         vix = yf.download("^VIX", period="5d", interval="1d",
                          auto_adjust=True, progress=False)
@@ -10,10 +257,9 @@ def get_vix_level():
             vix.columns = vix.columns.get_level_values(0)
         return float(vix['Close'].iloc[-1])
     except Exception:
-        return 20.0  # assume normal if we can't get it
+        return 20.0
 
 def get_spy_regime_strength():
-    """Returns how far SPY is above/below its 200MA (as %)."""
     try:
         spy = yf.download("SPY", period="1y", interval="1d",
                          auto_adjust=True, progress=False)
@@ -26,45 +272,18 @@ def get_spy_regime_strength():
         return 0.0
 
 def is_earnings_season():
-    """True if current month is a peak earnings month."""
     return datetime.now().month in [1, 4, 7, 10]
 
 def is_macro_event_week():
-    """Check for Fed meetings, CPI, NFP in next 3 days."""
-    # Simplified — in production, use an economic calendar API
-    # This is a stub that checks for first Friday of month (NFP)
     now = datetime.now()
-    if now.weekday() == 4 and now.day <= 7:  # First Friday
+    if now.weekday() == 4 and now.day <= 7:
         return True
     return False
 
-def get_win_streak():
-    """Read trade log to calculate consecutive wins/losses."""
-    try:
-        if not os.path.isfile(LOG_FILE):
-            return 0
-        df = pd.read_csv(LOG_FILE)
-        if len(df) < 2:
-            return 0
-        # Simplified: return 0 for now
-        return 0
-    except Exception:
-        return 0
-
-def get_peak_equity():
-    """Read bot.log or track peak equity separately."""
-    # For now, assume peak = current (no drawdown tracking yet)
-    return None
-
 def calculate_dynamic_threshold(equity, num_positions, log):
-    """
-    Returns the dynamic threshold based on current market conditions.
-    Base threshold is 4. Adjusted by circumstances.
-    """
     threshold = 4
     reasons = []
 
-    # Market regime strength
     regime_strength = get_spy_regime_strength()
     if regime_strength < 0:
         log(f"  🚫 SPY below 200MA ({regime_strength:.1f}%) — BLOCK ALL TRADES")
@@ -76,7 +295,6 @@ def calculate_dynamic_threshold(equity, num_positions, log):
         threshold -= 1
         reasons.append(f"Strong bull (-1, SPY +{regime_strength:.1f}%)")
 
-    # VIX level
     vix = get_vix_level()
     if vix > 30:
         threshold += 2
@@ -88,53 +306,82 @@ def calculate_dynamic_threshold(equity, num_positions, log):
         threshold -= 1
         reasons.append(f"VIX {vix:.1f} < 15 (-1, complacent)")
 
-    # Earnings season
     if is_earnings_season():
         threshold += 1
         reasons.append("Earnings season (+1)")
 
-    # Macro events
     if is_macro_event_week():
         threshold += 1
         reasons.append("Macro event week (+1)")
 
-    # Position count
     if num_positions >= 2:
         threshold += 1
         reasons.append(f"Already holding {num_positions} positions (+1)")
 
-    # Time of day
     now = datetime.now(timezone.utc)
     hour = now.hour
-    if now.weekday() == 0 and hour < 16:  # Monday morning ET
+    if now.weekday() == 0 and hour < 16:
         threshold += 1
         reasons.append("Monday morning (+1)")
-    if now.weekday() == 4 and hour >= 19:  # Friday afternoon ET
+    if now.weekday() == 4 and hour >= 19:
         threshold += 1
         reasons.append("Friday afternoon (+1)")
 
-    # Cap threshold between 3 and 8
-    threshold = max(3, min(threshold, 8))
+    threshold = max(3, min(threshold, 10))
     return threshold, reasons
 
 # ============================================================
 # POSITION SIZING SCALER
 # ============================================================
 def calculate_position_multiplier(score, threshold):
-    """Scale position size based on conviction above threshold."""
     if score <= threshold:
-        return 0.5      # Barely qualified
+        return 0.5
     elif score == threshold + 1:
         return 0.75
     elif score == threshold + 2:
-        return 1.0      # Standard
+        return 1.0
     elif score == threshold + 3:
         return 1.25
     else:
-        return 1.5      # Maximum conviction
+        return 1.5
 
 # ============================================================
-# MAIN BOT (Updated)
+# BROKER
+# ============================================================
+client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+
+def log_trade(symbol, side, qty, price, stop, target):
+    try:
+        file_exists = os.path.isfile(LOG_FILE)
+        with open(LOG_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["timestamp", "symbol", "side", "qty", "price", "stop", "target"])
+            writer.writerow([datetime.now().isoformat(), symbol, side, qty, price, stop, target])
+    except Exception as e:
+        log(f"⚠️ Log error: {e}")
+
+def place_bracket_order(symbol, side, qty, entry_price):
+    try:
+        stop_price = round(entry_price * (1 - STOP_LOSS_PCT), 2)
+        target_price = round(entry_price * (1 + 0.05), 2)
+        order_data = MarketOrderRequest(
+            symbol=symbol, qty=qty, side=side,
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=target_price),
+            stop_loss=StopLossRequest(stop_price=stop_price)
+        )
+        order = client.submit_order(order_data)
+        log(f"✅ {side} {qty} {symbol} @ ${entry_price:.2f} | SL: ${stop_price} | TP: ${target_price}")
+        log_trade(symbol, str(side), qty, entry_price, stop_price, target_price)
+        return order
+    except Exception as e:
+        log(f"❌ Order failed: {e}")
+        return None
+
+# ============================================================
+# MAIN BOT
 # ============================================================
 def run_bot():
     log("=" * 60)
@@ -161,13 +408,12 @@ def run_bot():
 
         log(f"Equity: ${equity:.2f} | Exposure: ${total_position_value:.2f} | Limit: ${tactical_limit:.2f}")
 
-        # === DYNAMIC THRESHOLD ===
         threshold, reasons = calculate_dynamic_threshold(equity, len(already_held), log)
         log(f"📊 DYNAMIC THRESHOLD: {threshold} (base was 4)")
         for reason in reasons:
             log(f"   → {reason}")
 
-        if threshold > 8:
+        if threshold > 10:
             log("🚫 Threshold exceeds max score. No trades today.")
             return
 
@@ -178,7 +424,6 @@ def run_bot():
             log(f"⚠️ Max positions ({MAX_POSITIONS}) reached.")
             return
 
-        # Score all candidates
         candidates = []
         for symbol in WATCHLIST:
             if symbol in already_held:
@@ -219,3 +464,6 @@ def run_bot():
 
     log("Bot cycle complete.")
     log("=" * 60)
+
+if __name__ == "__main__":
+    run_bot()
