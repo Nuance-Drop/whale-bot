@@ -10,23 +10,17 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: 'requirements.txt'
-
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Run bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -40,11 +34,11 @@ jobs:
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
           AIRTABLE_EXITS_TABLE_ID: ${{ secrets.AIRTABLE_EXITS_TABLE_ID }}
+          AIRTABLE_FILLS_TABLE_ID: ${{ secrets.AIRTABLE_FILLS_TABLE_ID }}
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
         run: python bot.py
-
-      - name: Upload bot log
+      - name: Upload logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -52,5 +46,6 @@ jobs:
           path: |
             bot.log
             trade_log.csv
+            peak_equity.txt
           retention-days: 30
           if-no-files-found: ignore
