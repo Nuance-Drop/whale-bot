@@ -4,3 +4,4 @@ pandas
 numpy
 vaderSentiment
 requests
+pyairtable
