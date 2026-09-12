@@ -1,9 +1,12 @@
 """
-Whale Bot v7 - Multi-Signal Confluence Engine with Dynamic Threshold, Telegram Alerts, and Full Airtable Tracking
+Whale Bot v8 - Multi-Signal Confluence Engine with Dynamic Threshold,
+Telegram Alerts, Full Airtable Tracking, Exponential Backoff, and Kalshi Integration
 """
 
 import os
 import csv
+import time
+import random
 import logging
 import requests
 from datetime import datetime, time, timezone, timedelta
@@ -34,6 +37,8 @@ AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_ID = os.environ.get("AIRTABLE_TABLE_ID")
 AIRTABLE_EXITS_TABLE_ID = os.environ.get("AIRTABLE_EXITS_TABLE_ID")
+KALSHI_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID")
+KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY")  # PEM string
 
 # ============================================================
 # CONFIGURATION
@@ -57,6 +62,32 @@ def log(msg):
     logging.info(msg)
 
 # ============================================================
+# EXPONENTIAL BACKOFF WRAPPER
+# ============================================================
+def safe_request(func, *args, max_retries=3, **kwargs):
+    """
+    Wrap any API call with exponential backoff + jitter.
+    Retries on 429, 500, 502, 503, 504 and network errors.
+    """
+    for attempt in range(max_retries):
+        try:
+            result = func(*args, **kwargs)
+            if hasattr(result, 'status_code'):
+                if result.status_code in [429, 500, 502, 503, 504]:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    log(f"⚠️ API returned {result.status_code}, retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+            return result
+        except (requests.exceptions.RequestException, ConnectionError) as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            log(f"⚠️ Request failed: {e}. Retrying in {wait:.1f}s")
+            time.sleep(wait)
+    return None
+
+# ============================================================
 # TELEGRAM
 # ============================================================
 def send_telegram(message):
@@ -64,7 +95,7 @@ def send_telegram(message):
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
+        safe_request(requests.post, url, json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "Markdown"
@@ -73,10 +104,113 @@ def send_telegram(message):
         log(f"⚠️ Telegram failed: {e}")
 
 # ============================================================
+# KALSHI INTEGRATION
+# ============================================================
+KALSHI_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
+
+def _kalshi_sign(method, path, timestamp_ms):
+    """Generate RSA-PSS signature for Kalshi API request."""
+    try:
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        import base64
+
+        if not KALSHI_PRIVATE_KEY:
+            return None
+
+        private_key = serialization.load_pem_private_key(
+            KALSHI_PRIVATE_KEY.encode('utf-8'),
+            password=None
+        )
+        message = f"{timestamp_ms}{method}{path}".encode('utf-8')
+        signature = private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode('utf-8')
+    except Exception as e:
+        log(f"⚠️ Kalshi sign error: {e}")
+        return None
+
+def _kalshi_headers(method, path):
+    """Build authentication headers for Kalshi API."""
+    if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
+        return None
+    ts = str(int(datetime.now().timestamp() * 1000))
+    sig = _kalshi_sign(method, path, ts)
+    if not sig:
+        return None
+    return {
+        "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": sig,
+        "Content-Type": "application/json"
+    }
+
+def kalshi_get_markets(series_ticker=None, limit=20):
+    """Fetch open markets from Kalshi (public endpoint, no auth required)."""
+    try:
+        url = f"{KALSHI_BASE_URL}/markets"
+        params = {"limit": limit, "status": "open"}
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        r = safe_request(requests.get, url, params=params, timeout=15)
+        if r is None or r.status_code != 200:
+            return []
+        return r.json().get("markets", [])
+    except Exception as e:
+        log(f"⚠️ Kalshi markets error: {e}")
+        return []
+
+def kalshi_macro_signal():
+    """
+    Use Kalshi market-implied probabilities as a macro regime signal.
+    If the market is pricing high odds of a risk event (recession, rate hike,
+    market crash), reduce exposure.
+    Returns a score adjustment: -1 (bearish), 0 (neutral), +1 (bullish).
+    """
+    try:
+        if not KALSHI_API_KEY_ID:
+            return 0  # No Kalshi creds, skip
+
+        # Search for macro markets (Fed, CPI, recession)
+        markets = kalshi_get_markets(series_ticker="KXFED", limit=5)
+        if not markets:
+            markets = kalshi_get_markets(limit=20)
+
+        # If no markets found, return neutral
+        if not markets:
+            return 0
+
+        # Look for "Fed rate cut" or "recession" markets
+        for m in markets:
+            title = (m.get("title") or "").lower()
+            yes_price = float(m.get("yes_bid", 0)) / 100 if m.get("yes_bid") else 0.5
+
+            # If market is pricing high odds of a NEGATIVE event
+            if any(kw in title for kw in ["recession", "rate hike", "crash", "default"]):
+                if yes_price > 0.60:
+                    log(f"  📉 Kalshi macro: {title} @ {yes_price:.0%} — risk-off")
+                    return -1
+            # If market is pricing high odds of a POSITIVE event
+            elif any(kw in title for kw in ["rate cut", "soft landing", "growth"]):
+                if yes_price > 0.60:
+                    log(f"  📈 Kalshi macro: {title} @ {yes_price:.0%} — risk-on")
+                    return +1
+
+        return 0
+    except Exception as e:
+        log(f"⚠️ Kalshi macro signal error: {e}")
+        return 0
+
+# ============================================================
 # AIRTABLE - TRADE ENTRIES
 # ============================================================
 def log_to_airtable(symbol, side, qty, price, stop, target, score, threshold, signals_dict):
-    """Log a new trade entry to Airtable."""
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]):
             log("⚠️ Airtable credentials missing.")
@@ -103,20 +237,17 @@ def log_to_airtable(symbol, side, qty, price, stop, target, score, threshold, si
 # AIRTABLE - TRADE EXITS
 # ============================================================
 def check_and_log_exits():
-    """Check Alpaca for recently closed SELL orders and log exits to Airtable."""
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]):
             log("⚠️ Airtable Exits credentials missing.")
             return
 
-        # Fetch closed orders (last 50 is plenty for a single bot)
         req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=50)
         closed = client.get_orders(filter=req)
 
         api = Api(AIRTABLE_API_KEY)
         exits_table = api.table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID)
 
-        # Get existing exit records to avoid duplicates
         existing = exits_table.all(fields=["Exit Timestamp", "Symbol"])
         existing_keys = set()
         for r in existing:
@@ -136,7 +267,6 @@ def check_and_log_exits():
             if key in existing_keys:
                 continue
 
-            # Determine exit reason
             exit_reason = "OTHER"
             try:
                 if order.order_type.value == "stop":
@@ -148,7 +278,6 @@ def check_and_log_exits():
             except Exception:
                 pass
 
-            # Find corresponding entry price (most recent BUY for this symbol)
             entry_price = None
             for o in closed:
                 if (o.symbol == order.symbol and o.side == OrderSide.BUY
@@ -157,7 +286,6 @@ def check_and_log_exits():
                     break
 
             if entry_price is None:
-                log(f"⚠️ No entry price found for {order.symbol} exit")
                 continue
 
             exit_price = float(order.filled_avg_price)
@@ -178,13 +306,11 @@ def check_and_log_exits():
                 "Signal Score": 0,
                 "Signal Threshold": 0
             })
-            log(f"📕 Logged exit: {order.symbol} {qty} @ ${exit_price:.2f} | PnL: ${pnl_dollars:.2f} ({pnl_pct:.2f}%)")
+            log(f"📕 Logged exit: {order.symbol} {qty} @ ${exit_price:.2f} | PnL: ${pnl_dollars:.2f}")
             logged_count += 1
 
         if logged_count > 0:
-            send_telegram(f"📕 *{logged_count} trade(s) exited* since last check. Check Airtable.")
-        else:
-            log("No new exits to log.")
+            send_telegram(f"📕 *{logged_count} trade(s) exited* since last check.")
 
     except Exception as e:
         log(f"⚠️ Exit tracking error: {e}")
@@ -211,8 +337,8 @@ def congressional_signal(symbol):
         params = {"ticker": symbol, "type": "buy",
                   "fromDate": (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"),
                   "limit": 5}
-        r = requests.get(url, headers=headers, params=params, timeout=15)
-        if r.status_code != 200:
+        r = safe_request(requests.get, url, headers=headers, params=params, timeout=15)
+        if r is None or r.status_code != 200:
             return False
         return len(r.json().get("trades", [])) > 0
     except Exception as e:
@@ -227,8 +353,8 @@ def insider_signal(symbol):
         if not FORM4API_KEY:
             return False
         url = f"https://api.form4api.com/v1/insider/trades/{symbol}"
-        r = requests.get(url, headers={"Authorization": f"Bearer {FORM4API_KEY}"}, timeout=15)
-        if r.status_code != 200:
+        r = safe_request(requests.get, url, headers={"Authorization": f"Bearer {FORM4API_KEY}"}, timeout=15)
+        if r is None or r.status_code != 200:
             return False
         cutoff = datetime.now() - timedelta(days=30)
         for t in r.json().get("trades", []):
@@ -267,9 +393,9 @@ def pead_signal(symbol):
 # ============================================================
 def options_flow_signal(symbol):
     try:
-        r = requests.post("https://mcp.gammarips.com/mcp",
-                          json={"method": "get_daily_report"}, timeout=10)
-        if r.status_code != 200:
+        r = safe_request(requests.post, "https://mcp.gammarips.com/mcp",
+                         json={"method": "get_daily_report"}, timeout=10)
+        if r is None or r.status_code != 200:
             return False
         for item in r.json().get('bullish_pool', []):
             if item.get('symbol') == symbol:
@@ -321,7 +447,7 @@ def sentiment_signal(symbol):
         return False
 
 # ============================================================
-# COMPOSITE SCORING
+# COMPOSITE SCORING (with Kalshi macro adjustment)
 # ============================================================
 def calculate_score(symbol):
     score = 0
@@ -329,6 +455,13 @@ def calculate_score(symbol):
     if not is_market_bullish():
         return 0, {"regime": False}
     score += 1; signals['regime'] = True
+
+    # Kalshi macro overlay
+    kalshi_adj = kalshi_macro_signal()
+    if kalshi_adj != 0:
+        score += kalshi_adj
+        signals['kalshi_macro'] = kalshi_adj
+
     rsi_ok, sma_ok = technical_signal(symbol)
     if rsi_ok: score += 1; signals['rsi'] = True
     if sma_ok: score += 1; signals['sma'] = True
@@ -337,7 +470,8 @@ def calculate_score(symbol):
     if insider_signal(symbol): score += 2; signals['insider'] = True
     if pead_signal(symbol): score += 1; signals['pead'] = True
     if options_flow_signal(symbol): score += 2; signals['flow'] = True
-    log(f"  {symbol} SCORE: {score}/10 | Signals: {signals}")
+
+    log(f"  {symbol} SCORE: {score}/11 | Signals: {signals}")
     return score, signals
 
 # ============================================================
@@ -399,7 +533,7 @@ def calculate_dynamic_threshold(equity, num_positions, log):
         threshold += 1; reasons.append("Monday AM (+1)")
     if now.weekday() == 4 and now.hour >= 19:
         threshold += 1; reasons.append("Friday PM (+1)")
-    return max(3, min(threshold, 10)), reasons
+    return max(3, min(threshold, 11)), reasons
 
 def calculate_position_multiplier(score, threshold):
     if score <= threshold: return 0.5
@@ -460,15 +594,13 @@ def place_bracket_order(symbol, side, qty, entry_price, score, threshold, signal
 # ============================================================
 def run_bot():
     log("=" * 60)
-    log(f"Bot v7 started at {datetime.now().isoformat()}")
+    log(f"Bot v8 started at {datetime.now().isoformat()}")
 
-    # Market hours check
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5 or now.hour < 14 or now.hour >= 21:
         log("Market closed. Exiting.")
         return
 
-    # First: check for and log any exits since the last run
     check_and_log_exits()
 
     try:
@@ -490,7 +622,7 @@ def run_bot():
         for r in reasons:
             log(f"   → {r}")
 
-        if threshold > 10:
+        if threshold > 11:
             log("🚫 Threshold exceeds max.")
             return
         if total_position_value >= tactical_limit:
