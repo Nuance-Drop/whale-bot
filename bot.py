@@ -1,5 +1,5 @@
 """
-Whale Bot v6 - Multi-Signal Confluence Engine with Dynamic Threshold + Airtable Logging
+Whale Bot v7 - Multi-Signal Confluence Engine with Dynamic Threshold, Telegram Alerts, and Full Airtable Tracking
 """
 
 import os
@@ -18,6 +18,7 @@ from alpaca.trading.enums import (
 import yfinance as yf
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from pyairtable import Api
 
 # ============================================================
 # API KEYS
@@ -32,6 +33,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_ID = os.environ.get("AIRTABLE_TABLE_ID")
+AIRTABLE_EXITS_TABLE_ID = os.environ.get("AIRTABLE_EXITS_TABLE_ID")
 
 # ============================================================
 # CONFIGURATION
@@ -71,11 +73,10 @@ def send_telegram(message):
         log(f"⚠️ Telegram failed: {e}")
 
 # ============================================================
-# AIRTABLE
+# AIRTABLE - TRADE ENTRIES
 # ============================================================
-from pyairtable import Api
-
 def log_to_airtable(symbol, side, qty, price, stop, target, score, threshold, signals_dict):
+    """Log a new trade entry to Airtable."""
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]):
             log("⚠️ Airtable credentials missing.")
@@ -94,9 +95,99 @@ def log_to_airtable(symbol, side, qty, price, stop, target, score, threshold, si
             "Threshold": threshold,
             "Signal Breakdown": str(signals_dict)
         })
-        log(f"✅ Logged to Airtable: {symbol}")
+        log(f"✅ Logged entry to Airtable: {symbol}")
     except Exception as e:
-        log(f"⚠️ Airtable log failed: {e}")
+        log(f"⚠️ Airtable entry log failed: {e}")
+
+# ============================================================
+# AIRTABLE - TRADE EXITS
+# ============================================================
+def check_and_log_exits():
+    """Check Alpaca for recently closed SELL orders and log exits to Airtable."""
+    try:
+        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]):
+            log("⚠️ Airtable Exits credentials missing.")
+            return
+
+        # Fetch closed orders (last 50 is plenty for a single bot)
+        req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=50)
+        closed = client.get_orders(filter=req)
+
+        api = Api(AIRTABLE_API_KEY)
+        exits_table = api.table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID)
+
+        # Get existing exit records to avoid duplicates
+        existing = exits_table.all(fields=["Exit Timestamp", "Symbol"])
+        existing_keys = set()
+        for r in existing:
+            sym = r['fields'].get('Symbol', '')
+            ts = r['fields'].get('Exit Timestamp', '')
+            existing_keys.add(f"{sym}_{ts}")
+
+        logged_count = 0
+        for order in closed:
+            if order.side != OrderSide.SELL:
+                continue
+            if order.filled_at is None or order.filled_avg_price is None:
+                continue
+
+            exit_ts = order.filled_at.isoformat()
+            key = f"{order.symbol}_{exit_ts}"
+            if key in existing_keys:
+                continue
+
+            # Determine exit reason
+            exit_reason = "OTHER"
+            try:
+                if order.order_type.value == "stop":
+                    exit_reason = "STOP_LOSS"
+                elif order.order_type.value == "limit":
+                    exit_reason = "TAKE_PROFIT"
+                elif order.order_type.value == "market":
+                    exit_reason = "MANUAL"
+            except Exception:
+                pass
+
+            # Find corresponding entry price (most recent BUY for this symbol)
+            entry_price = None
+            for o in closed:
+                if (o.symbol == order.symbol and o.side == OrderSide.BUY
+                        and o.filled_at and o.filled_avg_price):
+                    entry_price = float(o.filled_avg_price)
+                    break
+
+            if entry_price is None:
+                log(f"⚠️ No entry price found for {order.symbol} exit")
+                continue
+
+            exit_price = float(order.filled_avg_price)
+            qty = int(order.filled_qty)
+            pnl_dollars = (exit_price - entry_price) * qty
+            pnl_pct = (exit_price - entry_price) / entry_price * 100
+
+            exits_table.create({
+                "Exit Timestamp": exit_ts,
+                "Symbol": order.symbol,
+                "Entry Price": round(entry_price, 2),
+                "Exit Price": round(exit_price, 2),
+                "Qty": qty,
+                "Exit Reason": exit_reason,
+                "PnL Dollars": round(pnl_dollars, 2),
+                "PnL Percent": round(pnl_pct, 2),
+                "Signals That Fired": "",
+                "Signal Score": 0,
+                "Signal Threshold": 0
+            })
+            log(f"📕 Logged exit: {order.symbol} {qty} @ ${exit_price:.2f} | PnL: ${pnl_dollars:.2f} ({pnl_pct:.2f}%)")
+            logged_count += 1
+
+        if logged_count > 0:
+            send_telegram(f"📕 *{logged_count} trade(s) exited* since last check. Check Airtable.")
+        else:
+            log("No new exits to log.")
+
+    except Exception as e:
+        log(f"⚠️ Exit tracking error: {e}")
 
 # ============================================================
 # MARKET REGIME
@@ -109,7 +200,7 @@ def is_market_bullish():
     return spy['Close'].iloc[-1] > spy['SMA200'].iloc[-1]
 
 # ============================================================
-# SIGNALS
+# SIGNAL 1: CONGRESSIONAL
 # ============================================================
 def congressional_signal(symbol):
     try:
@@ -128,6 +219,9 @@ def congressional_signal(symbol):
         log(f"⚠️ Congress error: {e}")
         return False
 
+# ============================================================
+# SIGNAL 2: INSIDER
+# ============================================================
 def insider_signal(symbol):
     try:
         if not FORM4API_KEY:
@@ -146,6 +240,9 @@ def insider_signal(symbol):
         log(f"⚠️ Insider error: {e}")
         return False
 
+# ============================================================
+# SIGNAL 3: PEAD
+# ============================================================
 def pead_signal(symbol):
     try:
         earnings = yf.Ticker(symbol).earnings_dates
@@ -165,10 +262,13 @@ def pead_signal(symbol):
         log(f"⚠️ PEAD error: {e}")
         return False
 
+# ============================================================
+# SIGNAL 4: OPTIONS FLOW
+# ============================================================
 def options_flow_signal(symbol):
     try:
         r = requests.post("https://mcp.gammarips.com/mcp",
-                         json={"method": "get_daily_report"}, timeout=10)
+                          json={"method": "get_daily_report"}, timeout=10)
         if r.status_code != 200:
             return False
         for item in r.json().get('bullish_pool', []):
@@ -179,6 +279,9 @@ def options_flow_signal(symbol):
         log(f"⚠️ Flow error: {e}")
         return False
 
+# ============================================================
+# SIGNAL 5: TECHNICAL
+# ============================================================
 def technical_signal(symbol):
     try:
         df = yf.Ticker(symbol).history(period="3mo", interval="1d", auto_adjust=True)
@@ -198,6 +301,9 @@ def technical_signal(symbol):
         log(f"⚠️ Technical error: {e}")
         return (False, False)
 
+# ============================================================
+# SIGNAL 6: SENTIMENT
+# ============================================================
 analyzer = SentimentIntensityAnalyzer()
 
 def sentiment_signal(symbol):
@@ -215,7 +321,7 @@ def sentiment_signal(symbol):
         return False
 
 # ============================================================
-# SCORING
+# COMPOSITE SCORING
 # ============================================================
 def calculate_score(symbol):
     score = 0
@@ -269,11 +375,12 @@ def calculate_dynamic_threshold(equity, num_positions, log):
     reasons = []
     rs = get_spy_regime_strength()
     if rs < 0:
+        log(f"  🚫 SPY below 200MA ({rs:.1f}%) — BLOCK ALL TRADES")
         return 999, ["regime_block"]
     elif rs < 2:
-        threshold += 1; reasons.append(f"Fragile regime (+1)")
+        threshold += 1; reasons.append(f"Fragile regime (+1, SPY +{rs:.1f}%)")
     elif rs > 5:
-        threshold -= 1; reasons.append(f"Strong bull (-1)")
+        threshold -= 1; reasons.append(f"Strong bull (-1, SPY +{rs:.1f}%)")
     vix = get_vix_level()
     if vix > 30:
         threshold += 2; reasons.append(f"VIX {vix:.1f} (+2)")
@@ -306,7 +413,7 @@ def calculate_position_multiplier(score, threshold):
 # ============================================================
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
-def log_trade(symbol, side, qty, price, stop, target):
+def log_trade_csv(symbol, side, qty, price, stop, target):
     try:
         fe = os.path.isfile(LOG_FILE)
         with open(LOG_FILE, 'a', newline='') as f:
@@ -315,7 +422,7 @@ def log_trade(symbol, side, qty, price, stop, target):
                 w.writerow(["timestamp", "symbol", "side", "qty", "price", "stop", "target"])
             w.writerow([datetime.now().isoformat(), symbol, side, qty, price, stop, target])
     except Exception as e:
-        log(f"⚠️ Log error: {e}")
+        log(f"⚠️ CSV log error: {e}")
 
 def place_bracket_order(symbol, side, qty, entry_price, score, threshold, signals):
     try:
@@ -330,7 +437,7 @@ def place_bracket_order(symbol, side, qty, entry_price, score, threshold, signal
         )
         order = client.submit_order(order_data)
         log(f"✅ {side} {qty} {symbol} @ ${entry_price:.2f} | SL: ${stop_price} | TP: ${target_price}")
-        log_trade(symbol, str(side), qty, entry_price, stop_price, target_price)
+        log_trade_csv(symbol, str(side), qty, entry_price, stop_price, target_price)
 
         alert = (
             f"🚨 *TRADE PLACED*\n\n"
@@ -353,12 +460,16 @@ def place_bracket_order(symbol, side, qty, entry_price, score, threshold, signal
 # ============================================================
 def run_bot():
     log("=" * 60)
-    log(f"Bot v6 started at {datetime.now().isoformat()}")
+    log(f"Bot v7 started at {datetime.now().isoformat()}")
 
+    # Market hours check
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5 or now.hour < 14 or now.hour >= 21:
         log("Market closed. Exiting.")
         return
+
+    # First: check for and log any exits since the last run
+    check_and_log_exits()
 
     try:
         account = client.get_account()
@@ -386,7 +497,7 @@ def run_bot():
             log("⚠️ Tactical limit reached.")
             return
         if len(already_held) >= MAX_POSITIONS:
-            log(f"⚠️ Max positions reached.")
+            log(f"⚠️ Max positions ({MAX_POSITIONS}) reached.")
             return
 
         candidates = []
@@ -401,7 +512,7 @@ def run_bot():
                 log(f"  ❌ {symbol}: Score {score} below {threshold}")
 
         if not candidates:
-            log("No tickers met threshold.")
+            log("No tickers met the dynamic threshold.")
             return
 
         candidates.sort(key=lambda x: x[1], reverse=True)
@@ -418,7 +529,7 @@ def run_bot():
         qty = min(int(risk_amount / risk_per_share), int(remaining / price))
 
         if qty < 1:
-            log(f"⚠️ Not enough room for 1 share.")
+            log(f"⚠️ Not enough room for 1 share of {symbol}.")
             return
 
         place_bracket_order(symbol, OrderSide.BUY, qty, price, score, threshold, signals)
