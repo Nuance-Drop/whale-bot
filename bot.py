@@ -1,6 +1,5 @@
 """
-Whale Bot v5 - Multi-Signal Confluence Engine with Dynamic Threshold + Telegram Alerts
-Combines: Congressional Trades + Insider Trades + PEAD + Options Flow + RSI/SMA + Sentiment
+Whale Bot v6 - Multi-Signal Confluence Engine with Dynamic Threshold + Airtable Logging
 """
 
 import os
@@ -30,6 +29,9 @@ FORM4API_KEY = os.environ.get("FORM4API_KEY")
 BARGO_API_KEY = os.environ.get("BARGO_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
+AIRTABLE_TABLE_ID = os.environ.get("AIRTABLE_TABLE_ID")
 
 # ============================================================
 # CONFIGURATION
@@ -53,10 +55,9 @@ def log(msg):
     logging.info(msg)
 
 # ============================================================
-# TELEGRAM NOTIFICATIONS
+# TELEGRAM
 # ============================================================
 def send_telegram(message):
-    """Send a Telegram message. Never crashes the bot if it fails."""
     try:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             return
@@ -70,18 +71,45 @@ def send_telegram(message):
         log(f"⚠️ Telegram failed: {e}")
 
 # ============================================================
+# AIRTABLE
+# ============================================================
+from pyairtable import Api
+
+def log_to_airtable(symbol, side, qty, price, stop, target, score, threshold, signals_dict):
+    try:
+        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]):
+            log("⚠️ Airtable credentials missing.")
+            return
+        api = Api(AIRTABLE_API_KEY)
+        table = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID)
+        table.create({
+            "Timestamp": datetime.now().isoformat(),
+            "Symbol": symbol,
+            "Side": str(side),
+            "Qty": qty,
+            "Price": price,
+            "Stop": stop,
+            "Target": target,
+            "Score": score,
+            "Threshold": threshold,
+            "Signal Breakdown": str(signals_dict)
+        })
+        log(f"✅ Logged to Airtable: {symbol}")
+    except Exception as e:
+        log(f"⚠️ Airtable log failed: {e}")
+
+# ============================================================
 # MARKET REGIME
 # ============================================================
 def is_market_bullish():
-    spy = yf.download("SPY", period="1y", interval="1d",
-                      auto_adjust=True, progress=False)
+    spy = yf.download("SPY", period="1y", interval="1d", auto_adjust=True, progress=False)
     if isinstance(spy.columns, pd.MultiIndex):
         spy.columns = spy.columns.get_level_values(0)
     spy['SMA200'] = spy['Close'].rolling(200).mean()
     return spy['Close'].iloc[-1] > spy['SMA200'].iloc[-1]
 
 # ============================================================
-# SIGNAL 1: CONGRESSIONAL TRADES (Bargo Congress - Free)
+# SIGNALS
 # ============================================================
 def congressional_signal(symbol):
     try:
@@ -89,51 +117,38 @@ def congressional_signal(symbol):
             return False
         url = "https://www.bargo.ai/free-apis/congress/v1/trades"
         headers = {"X-Api-Key": BARGO_API_KEY}
-        params = {
-            "ticker": symbol,
-            "type": "buy",
-            "fromDate": (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"),
-            "limit": 5
-        }
+        params = {"ticker": symbol, "type": "buy",
+                  "fromDate": (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"),
+                  "limit": 5}
         r = requests.get(url, headers=headers, params=params, timeout=15)
         if r.status_code != 200:
             return False
-        data = r.json()
-        return len(data.get("trades", [])) > 0
+        return len(r.json().get("trades", [])) > 0
     except Exception as e:
-        log(f"⚠️ Congressional signal error: {e}")
+        log(f"⚠️ Congress error: {e}")
         return False
 
-# ============================================================
-# SIGNAL 2: INSIDER TRADES (Form4API - Free)
-# ============================================================
 def insider_signal(symbol):
     try:
         if not FORM4API_KEY:
             return False
         url = f"https://api.form4api.com/v1/insider/trades/{symbol}"
-        headers = {"Authorization": f"Bearer {FORM4API_KEY}"}
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers={"Authorization": f"Bearer {FORM4API_KEY}"}, timeout=15)
         if r.status_code != 200:
             return False
-        data = r.json()
         cutoff = datetime.now() - timedelta(days=30)
-        for trade in data.get("trades", []):
-            trade_date = pd.to_datetime(trade.get("filingDate", "2000-01-01"))
-            if trade_date > cutoff and trade.get("transactionCode") in ["P", "A"]:
+        for t in r.json().get("trades", []):
+            td = pd.to_datetime(t.get("filingDate", "2000-01-01"))
+            if td > cutoff and t.get("transactionCode") in ["P", "A"]:
                 return True
         return False
     except Exception as e:
-        log(f"⚠️ Insider signal error: {e}")
+        log(f"⚠️ Insider error: {e}")
         return False
 
-# ============================================================
-# SIGNAL 3: PEAD
-# ============================================================
 def pead_signal(symbol):
     try:
-        ticker = yf.Ticker(symbol)
-        earnings = ticker.earnings_dates
+        earnings = yf.Ticker(symbol).earnings_dates
         if earnings is None or earnings.empty:
             return False
         for idx, row in earnings.iterrows():
@@ -141,9 +156,7 @@ def pead_signal(symbol):
             if pd.Timestamp.now() - ed > pd.Timedelta(days=30):
                 continue
             try:
-                reported = float(row.get('Reported EPS', 0))
-                estimate = float(row.get('EPS Estimate', 0))
-                if reported > estimate:
+                if float(row.get('Reported EPS', 0)) > float(row.get('EPS Estimate', 0)):
                     return True
             except Exception:
                 continue
@@ -152,31 +165,23 @@ def pead_signal(symbol):
         log(f"⚠️ PEAD error: {e}")
         return False
 
-# ============================================================
-# SIGNAL 4: OPTIONS FLOW
-# ============================================================
 def options_flow_signal(symbol):
     try:
-        url = "https://mcp.gammarips.com/mcp"
-        r = requests.post(url, json={"method": "get_daily_report"}, timeout=10)
+        r = requests.post("https://mcp.gammarips.com/mcp",
+                         json={"method": "get_daily_report"}, timeout=10)
         if r.status_code != 200:
             return False
-        data = r.json()
-        for item in data.get('bullish_pool', []):
+        for item in r.json().get('bullish_pool', []):
             if item.get('symbol') == symbol:
                 return True
         return False
     except Exception as e:
-        log(f"⚠️ Options flow error: {e}")
+        log(f"⚠️ Flow error: {e}")
         return False
 
-# ============================================================
-# SIGNAL 5: TECHNICAL
-# ============================================================
 def technical_signal(symbol):
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="3mo", interval="1d", auto_adjust=True)
+        df = yf.Ticker(symbol).history(period="3mo", interval="1d", auto_adjust=True)
         if df.empty or len(df) < 50:
             return (False, False)
         df['SMA50'] = df['Close'].rolling(50).mean()
@@ -193,15 +198,11 @@ def technical_signal(symbol):
         log(f"⚠️ Technical error: {e}")
         return (False, False)
 
-# ============================================================
-# SIGNAL 6: SENTIMENT
-# ============================================================
 analyzer = SentimentIntensityAnalyzer()
 
 def sentiment_signal(symbol):
     try:
-        ticker = yf.Ticker(symbol)
-        news = ticker.news
+        news = yf.Ticker(symbol).news
         if not news:
             return False
         scores = []
@@ -214,28 +215,22 @@ def sentiment_signal(symbol):
         return False
 
 # ============================================================
-# COMPOSITE SCORING
+# SCORING
 # ============================================================
 def calculate_score(symbol):
     score = 0
     signals = {}
     if not is_market_bullish():
         return 0, {"regime": False}
-    score += 1
-    signals['regime'] = True
+    score += 1; signals['regime'] = True
     rsi_ok, sma_ok = technical_signal(symbol)
     if rsi_ok: score += 1; signals['rsi'] = True
     if sma_ok: score += 1; signals['sma'] = True
-    if sentiment_signal(symbol):
-        score += 1; signals['sentiment'] = True
-    if congressional_signal(symbol):
-        score += 2; signals['congress'] = True
-    if insider_signal(symbol):
-        score += 2; signals['insider'] = True
-    if pead_signal(symbol):
-        score += 1; signals['pead'] = True
-    if options_flow_signal(symbol):
-        score += 2; signals['flow'] = True
+    if sentiment_signal(symbol): score += 1; signals['sentiment'] = True
+    if congressional_signal(symbol): score += 2; signals['congress'] = True
+    if insider_signal(symbol): score += 2; signals['insider'] = True
+    if pead_signal(symbol): score += 1; signals['pead'] = True
+    if options_flow_signal(symbol): score += 2; signals['flow'] = True
     log(f"  {symbol} SCORE: {score}/10 | Signals: {signals}")
     return score, signals
 
@@ -244,8 +239,7 @@ def calculate_score(symbol):
 # ============================================================
 def get_vix_level():
     try:
-        vix = yf.download("^VIX", period="5d", interval="1d",
-                         auto_adjust=True, progress=False)
+        vix = yf.download("^VIX", period="5d", interval="1d", auto_adjust=True, progress=False)
         if isinstance(vix.columns, pd.MultiIndex):
             vix.columns = vix.columns.get_level_values(0)
         return float(vix['Close'].iloc[-1])
@@ -254,8 +248,7 @@ def get_vix_level():
 
 def get_spy_regime_strength():
     try:
-        spy = yf.download("SPY", period="1y", interval="1d",
-                         auto_adjust=True, progress=False)
+        spy = yf.download("SPY", period="1y", interval="1d", auto_adjust=True, progress=False)
         if isinstance(spy.columns, pd.MultiIndex):
             spy.columns = spy.columns.get_level_values(0)
         spy['SMA200'] = spy['Close'].rolling(200).mean()
@@ -269,66 +262,44 @@ def is_earnings_season():
 
 def is_macro_event_week():
     now = datetime.now()
-    if now.weekday() == 4 and now.day <= 7:
-        return True
-    return False
+    return now.weekday() == 4 and now.day <= 7
 
 def calculate_dynamic_threshold(equity, num_positions, log):
     threshold = 4
     reasons = []
-    regime_strength = get_spy_regime_strength()
-    if regime_strength < 0:
-        log(f"  🚫 SPY below 200MA ({regime_strength:.1f}%) — BLOCK ALL TRADES")
+    rs = get_spy_regime_strength()
+    if rs < 0:
         return 999, ["regime_block"]
-    elif regime_strength < 2:
-        threshold += 1
-        reasons.append(f"Fragile regime (+1, SPY only +{regime_strength:.1f}%)")
-    elif regime_strength > 5:
-        threshold -= 1
-        reasons.append(f"Strong bull (-1, SPY +{regime_strength:.1f}%)")
+    elif rs < 2:
+        threshold += 1; reasons.append(f"Fragile regime (+1)")
+    elif rs > 5:
+        threshold -= 1; reasons.append(f"Strong bull (-1)")
     vix = get_vix_level()
     if vix > 30:
-        threshold += 2
-        reasons.append(f"VIX {vix:.1f} > 30 (+2)")
+        threshold += 2; reasons.append(f"VIX {vix:.1f} (+2)")
     elif vix > 20:
-        threshold += 1
-        reasons.append(f"VIX {vix:.1f} elevated (+1)")
+        threshold += 1; reasons.append(f"VIX {vix:.1f} (+1)")
     elif vix < 15:
-        threshold -= 1
-        reasons.append(f"VIX {vix:.1f} < 15 (-1)")
+        threshold -= 1; reasons.append(f"VIX {vix:.1f} (-1)")
     if is_earnings_season():
-        threshold += 1
-        reasons.append("Earnings season (+1)")
+        threshold += 1; reasons.append("Earnings season (+1)")
     if is_macro_event_week():
-        threshold += 1
-        reasons.append("Macro event week (+1)")
+        threshold += 1; reasons.append("Macro week (+1)")
     if num_positions >= 2:
-        threshold += 1
-        reasons.append(f"Holding {num_positions} positions (+1)")
+        threshold += 1; reasons.append(f"Holding {num_positions} (+1)")
     now = datetime.now(timezone.utc)
     if now.weekday() == 0 and now.hour < 16:
-        threshold += 1
-        reasons.append("Monday morning (+1)")
+        threshold += 1; reasons.append("Monday AM (+1)")
     if now.weekday() == 4 and now.hour >= 19:
-        threshold += 1
-        reasons.append("Friday afternoon (+1)")
-    threshold = max(3, min(threshold, 10))
-    return threshold, reasons
+        threshold += 1; reasons.append("Friday PM (+1)")
+    return max(3, min(threshold, 10)), reasons
 
-# ============================================================
-# POSITION SIZING
-# ============================================================
 def calculate_position_multiplier(score, threshold):
-    if score <= threshold:
-        return 0.5
-    elif score == threshold + 1:
-        return 0.75
-    elif score == threshold + 2:
-        return 1.0
-    elif score == threshold + 3:
-        return 1.25
-    else:
-        return 1.5
+    if score <= threshold: return 0.5
+    elif score == threshold + 1: return 0.75
+    elif score == threshold + 2: return 1.0
+    elif score == threshold + 3: return 1.25
+    else: return 1.5
 
 # ============================================================
 # BROKER
@@ -337,16 +308,16 @@ client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
 def log_trade(symbol, side, qty, price, stop, target):
     try:
-        file_exists = os.path.isfile(LOG_FILE)
+        fe = os.path.isfile(LOG_FILE)
         with open(LOG_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["timestamp", "symbol", "side", "qty", "price", "stop", "target"])
-            writer.writerow([datetime.now().isoformat(), symbol, side, qty, price, stop, target])
+            w = csv.writer(f)
+            if not fe:
+                w.writerow(["timestamp", "symbol", "side", "qty", "price", "stop", "target"])
+            w.writerow([datetime.now().isoformat(), symbol, side, qty, price, stop, target])
     except Exception as e:
         log(f"⚠️ Log error: {e}")
 
-def place_bracket_order(symbol, side, qty, entry_price, score, threshold):
+def place_bracket_order(symbol, side, qty, entry_price, score, threshold, signals):
     try:
         stop_price = round(entry_price * (1 - STOP_LOSS_PCT), 2)
         target_price = round(entry_price * (1 + 0.05), 2)
@@ -361,20 +332,16 @@ def place_bracket_order(symbol, side, qty, entry_price, score, threshold):
         log(f"✅ {side} {qty} {symbol} @ ${entry_price:.2f} | SL: ${stop_price} | TP: ${target_price}")
         log_trade(symbol, str(side), qty, entry_price, stop_price, target_price)
 
-        # Telegram alert for the trade
         alert = (
             f"🚨 *TRADE PLACED*\n\n"
-            f"*Symbol:* {symbol}\n"
-            f"*Side:* BUY\n"
-            f"*Quantity:* {qty} shares\n"
-            f"*Entry:* ${entry_price:.2f}\n"
-            f"*Stop-Loss:* ${stop_price}\n"
-            f"*Target:* ${target_price}\n"
-            f"*Score:* {score}/{threshold}\n"
+            f"*Symbol:* {symbol}\n*Side:* BUY\n*Quantity:* {qty} shares\n"
+            f"*Entry:* ${entry_price:.2f}\n*Stop-Loss:* ${stop_price}\n"
+            f"*Target:* ${target_price}\n*Score:* {score}/{threshold}\n"
             f"*Cost:* ${qty * entry_price:.2f}\n\n"
             f"Equity: ${float(client.get_account().equity):.2f}"
         )
         send_telegram(alert)
+        log_to_airtable(symbol, str(side), qty, entry_price, stop_price, target_price, score, threshold, signals)
         return order
     except Exception as e:
         log(f"❌ Order failed: {e}")
@@ -382,11 +349,11 @@ def place_bracket_order(symbol, side, qty, entry_price, score, threshold):
         return None
 
 # ============================================================
-# MAIN BOT
+# MAIN
 # ============================================================
 def run_bot():
     log("=" * 60)
-    log(f"Bot v5 started at {datetime.now().isoformat()}")
+    log(f"Bot v6 started at {datetime.now().isoformat()}")
 
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5 or now.hour < 14 or now.hour >= 21:
@@ -408,18 +375,18 @@ def run_bot():
         log(f"Equity: ${equity:.2f} | Exposure: ${total_position_value:.2f} | Limit: ${tactical_limit:.2f}")
 
         threshold, reasons = calculate_dynamic_threshold(equity, len(already_held), log)
-        log(f"📊 DYNAMIC THRESHOLD: {threshold} (base was 4)")
-        for reason in reasons:
-            log(f"   → {reason}")
+        log(f"📊 DYNAMIC THRESHOLD: {threshold}")
+        for r in reasons:
+            log(f"   → {r}")
 
         if threshold > 10:
-            log("🚫 Threshold exceeds max score. No trades today.")
+            log("🚫 Threshold exceeds max.")
             return
         if total_position_value >= tactical_limit:
             log("⚠️ Tactical limit reached.")
             return
         if len(already_held) >= MAX_POSITIONS:
-            log(f"⚠️ Max positions ({MAX_POSITIONS}) reached.")
+            log(f"⚠️ Max positions reached.")
             return
 
         candidates = []
@@ -429,33 +396,32 @@ def run_bot():
                 continue
             score, signals = calculate_score(symbol)
             if score >= threshold:
-                candidates.append((symbol, score))
+                candidates.append((symbol, score, signals))
             else:
-                log(f"  ❌ {symbol}: Score {score} below threshold {threshold}")
+                log(f"  ❌ {symbol}: Score {score} below {threshold}")
 
         if not candidates:
-            log("No tickers met the dynamic threshold.")
+            log("No tickers met threshold.")
             return
 
         candidates.sort(key=lambda x: x[1], reverse=True)
-        symbol, score = candidates[0]
+        symbol, score, signals = candidates[0]
         multiplier = calculate_position_multiplier(score, threshold)
-        log(f"🎯 TRADING {symbol} (Score: {score}/{threshold}) | Size multiplier: {multiplier}x")
+        log(f"🎯 TRADING {symbol} (Score: {score}/{threshold}) | Mult: {multiplier}x")
 
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="1d", auto_adjust=True)
+        hist = yf.Ticker(symbol).history(period="1d", auto_adjust=True)
         price = float(hist['Close'].iloc[-1])
 
-        remaining_tactical = tactical_limit - total_position_value
+        remaining = tactical_limit - total_position_value
         risk_amount = equity * RISK_PER_TRADE * multiplier
         risk_per_share = price * STOP_LOSS_PCT
-        qty = min(int(risk_amount / risk_per_share), int(remaining_tactical / price))
+        qty = min(int(risk_amount / risk_per_share), int(remaining / price))
 
         if qty < 1:
-            log(f"⚠️ Not enough room for 1 share of {symbol}.")
+            log(f"⚠️ Not enough room for 1 share.")
             return
 
-        place_bracket_order(symbol, OrderSide.BUY, qty, price, score, threshold)
+        place_bracket_order(symbol, OrderSide.BUY, qty, price, score, threshold, signals)
 
     except Exception as e:
         log(f"❌ Bot error: {e}")
