@@ -1,0 +1,33 @@
+name: Weekly IC Update
+
+on:
+  schedule:
+    - cron: '0 14 * * 0'   # Sundays at 14:00 UTC
+  workflow_dispatch:
+
+jobs:
+  update-weights:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install requests numpy pandas
+      - name: Run IC update
+        env:
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
+          AIRTABLE_EXITS_TABLE_ID: ${{ secrets.AIRTABLE_EXITS_TABLE_ID }}
+        run: python scripts/weekly_ic_update.py
+      - name: Commit weights if changed
+        run: |
+          git config user.name "whale-bot"
+          git config user.email "bot@whale-bot.local"
+          git add signal_weights.json
+          git diff --staged --quiet || git commit -m "Weekly IC weight update [skip ci]"
+          git push || echo "No changes to push"
