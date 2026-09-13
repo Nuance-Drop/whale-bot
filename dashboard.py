@@ -1,10 +1,29 @@
+"""
+Whale Bot Dashboard — Frutiger Aero Edition
+Bright sky, glossy glass, Windows 7 / Vista era aesthetic.
+"""
+
+import streamlit as st
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+st.set_page_config(
+    page_title="Whale Bot",
+    page_icon="🐋",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ============================================================
+# FRUTIGER AERO CSS
+# ============================================================
 AERO_CSS = """
 <style>
-/* ============================================================
-   FRUTIGER AERO THEME — Windows 7 / Vista era
-   Bright sky, glossy glass, skeuomorphic depth
-   ============================================================ */
-
 @import url('https://fonts.googleapis.com/css2?family=Segoe+UI:wght@300;400;600;700&display=swap');
 
 html, body, [class*="css"] {
@@ -12,19 +31,14 @@ html, body, [class*="css"] {
     color: #0e3a4a !important;
 }
 
-/* ============================================================
-   BACKGROUND: BRIGHT SKY + CLOUDS + GREEN HILL
-   ============================================================ */
+/* ---------- BACKGROUND: SKY + CLOUDS + GREEN HILL ---------- */
 .stApp {
     background:
-        /* White clouds */
         radial-gradient(ellipse 60% 18% at 15% 12%, rgba(255,255,255,0.95) 0%, rgba(255,255,255,0) 60%),
         radial-gradient(ellipse 45% 12% at 80% 8%, rgba(255,255,255,0.85) 0%, rgba(255,255,255,0) 60%),
         radial-gradient(ellipse 55% 15% at 50% 20%, rgba(255,255,255,0.75) 0%, rgba(255,255,255,0) 65%),
         radial-gradient(ellipse 40% 10% at 25% 28%, rgba(255,255,255,0.6) 0%, rgba(255,255,255,0) 60%),
-        /* Green grass bloom at bottom */
         radial-gradient(ellipse 100% 30% at 50% 100%, #7ac470 0%, #5fb454 40%, rgba(95,180,84,0) 80%),
-        /* Bright sky gradient */
         linear-gradient(180deg, #4fc3ee 0%, #6dd0f0 25%, #98e2ef 55%, #b8e8d8 80%, #a8dd9a 100%) !important;
     background-attachment: fixed !important;
     min-height: 100vh;
@@ -52,26 +66,22 @@ html, body, [class*="css"] {
     100% { background-position: 100px -700px, -120px -800px, 80px -600px, -60px -500px, 40px -550px; }
 }
 
-/* Streamlit chrome hide */
 #MainMenu, footer, header { visibility: hidden; }
 .block-container {
-    padding-top: 1rem !important;
+    padding-top: 1.5rem !important;
     padding-bottom: 3rem !important;
     max-width: 1200px;
     position: relative;
     z-index: 1;
 }
 
-/* ============================================================
-   WINDOWS-STYLE TITLE BAR for headings
-   ============================================================ */
+/* ---------- WINDOWS-STYLE TITLE BAR ---------- */
 h1 {
     background: linear-gradient(180deg, #d8eef8 0%, #a4d4ea 48%, #7bb8d8 52%, #5a9ac0 100%) !important;
     color: #103a52 !important;
     padding: 14px 22px !important;
-    border-radius: 8px 8px 0 0 !important;
+    border-radius: 8px !important;
     border: 1px solid #4d8aa8 !important;
-    border-bottom: none !important;
     box-shadow:
         inset 0 1px 0 rgba(255,255,255,0.95),
         inset 0 -1px 0 rgba(0,50,80,0.15),
@@ -80,13 +90,7 @@ h1 {
     font-weight: 400 !important;
     letter-spacing: 0.5px !important;
     text-shadow: 0 1px 0 rgba(255,255,255,0.9) !important;
-    margin-bottom: 0 !important;
-    position: relative;
-}
-
-/* Small text under the h1 becomes the window body */
-.stApp > div > div > div > div > div > div > div:first-child p {
-    /* handled by markdown below */
+    margin-bottom: 0.5rem !important;
 }
 
 h2 {
@@ -110,9 +114,7 @@ h3, h4 {
     text-shadow: 0 1px 0 rgba(255,255,255,0.9), 0 2px 4px rgba(0,50,80,0.15) !important;
 }
 
-/* ============================================================
-   GLASS PANELS — Windows 7 Aero glass
-   ============================================================ */
+/* ---------- GLASS PANELS ---------- */
 [data-testid="stMetric"],
 [data-testid="stDataFrame"],
 [data-testid="stExpander"],
@@ -136,7 +138,6 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     position: relative;
 }
 
-/* Gloss highlight on top of each panel */
 [data-testid="stMetric"]::before {
     content: '';
     position: absolute;
@@ -147,9 +148,7 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     pointer-events: none;
 }
 
-/* ============================================================
-   METRIC VALUES — bold Windows sidebar gadget style
-   ============================================================ */
+/* ---------- METRIC VALUES ---------- */
 [data-testid="stMetricValue"] {
     color: #0d5a7a !important;
     font-weight: 700 !important;
@@ -157,7 +156,6 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     text-shadow:
         0 1px 0 rgba(255,255,255,0.95),
         0 2px 6px rgba(0,80,120,0.2) !important;
-    font-family: 'Segoe UI', sans-serif !important;
 }
 
 [data-testid="stMetricLabel"] {
@@ -169,9 +167,7 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     text-shadow: 0 1px 0 rgba(255,255,255,0.8) !important;
 }
 
-/* ============================================================
-   AERO GLASS BUTTONS — skeuomorphic Windows 7 style
-   ============================================================ */
+/* ---------- AERO BUTTONS ---------- */
 .stButton > button, .stDownloadButton > button {
     background:
         linear-gradient(180deg,
@@ -210,28 +206,18 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 }
 
 .stButton > button:active {
-    background:
-        linear-gradient(180deg,
-            #7bb8d8 0%,
-            #4d94b8 100%) !important;
-    box-shadow:
-        inset 0 2px 6px rgba(0,50,80,0.4) !important;
-    padding-top: 0.65rem !important;
-    padding-bottom: 0.45rem !important;
+    background: linear-gradient(180deg, #7bb8d8 0%, #4d94b8 100%) !important;
+    box-shadow: inset 0 2px 6px rgba(0,50,80,0.4) !important;
 }
 
-/* ============================================================
-   TABS — Aero tab style
-   ============================================================ */
+/* ---------- TABS ---------- */
 .stTabs [data-baseweb="tab-list"] {
     gap: 4px;
     background: transparent !important;
     border: none !important;
 }
 .stTabs [data-baseweb="tab"] {
-    background: linear-gradient(180deg,
-        rgba(255,255,255,0.7) 0%,
-        rgba(200,235,255,0.55) 100%) !important;
+    background: linear-gradient(180deg, rgba(255,255,255,0.7) 0%, rgba(200,235,255,0.55) 100%) !important;
     backdrop-filter: blur(10px);
     border: 1px solid rgba(255,255,255,0.9) !important;
     border-bottom: none !important;
@@ -242,19 +228,14 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     box-shadow: inset 0 1px 0 rgba(255,255,255,1) !important;
 }
 .stTabs [aria-selected="true"] {
-    background: linear-gradient(180deg,
-        #ffffff 0%,
-        #e0f2ff 50%,
-        #c8e8fa 100%) !important;
+    background: linear-gradient(180deg, #ffffff 0%, #e0f2ff 50%, #c8e8fa 100%) !important;
     color: #054a6a !important;
     box-shadow:
         inset 0 1px 0 rgba(255,255,255,1),
         0 -1px 8px rgba(100,180,220,0.4) !important;
 }
 
-/* ============================================================
-   DATAFRAMES — light glass with aqua header
-   ============================================================ */
+/* ---------- DATAFRAMES ---------- */
 [data-testid="stDataFrame"],
 [data-testid="stDataFrameResizable"],
 [data-testid="stDataFrame"] > div,
@@ -287,13 +268,9 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     border-radius: 10px !important;
 }
 
-/* ============================================================
-   INFO / ALERT BOXES — glossy Aero panels
-   ============================================================ */
+/* ---------- ALERT BOXES ---------- */
 .stAlert {
-    background: linear-gradient(180deg,
-        rgba(255,255,255,0.9) 0%,
-        rgba(215,240,255,0.75) 100%) !important;
+    background: linear-gradient(180deg, rgba(255,255,255,0.9) 0%, rgba(215,240,255,0.75) 100%) !important;
     backdrop-filter: blur(14px);
     border: 1px solid rgba(255,255,255,0.95) !important;
     border-left: 4px solid #4fc3ee !important;
@@ -305,9 +282,7 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     font-weight: 500 !important;
 }
 
-/* ============================================================
-   DIVIDERS — glossy white line
-   ============================================================ */
+/* ---------- DIVIDERS ---------- */
 hr {
     border: none !important;
     height: 2px !important;
@@ -319,21 +294,14 @@ hr {
     box-shadow: 0 1px 2px rgba(0,80,120,0.15) !important;
 }
 
-/* ============================================================
-   SIDEBAR — glass panel
-   ============================================================ */
+/* ---------- SIDEBAR ---------- */
 [data-testid="stSidebar"] {
-    background: linear-gradient(180deg,
-        rgba(255,255,255,0.8) 0%,
-        rgba(200,235,255,0.7) 100%) !important;
+    background: linear-gradient(180deg, rgba(255,255,255,0.8) 0%, rgba(200,235,255,0.7) 100%) !important;
     backdrop-filter: blur(20px);
     border-right: 1px solid rgba(255,255,255,0.95) !important;
-    box-shadow: inset -1px 0 0 rgba(120,180,220,0.3) !important;
 }
 
-/* ============================================================
-   CHARTS — glass panels
-   ============================================================ */
+/* ---------- CHARTS ---------- */
 [data-testid="stArrowVegaLiteChart"],
 [data-testid="stVegaLiteChart"] {
     background: rgba(255,255,255,0.5) !important;
@@ -345,9 +313,7 @@ hr {
         0 3px 8px rgba(0,80,120,0.18) !important;
 }
 
-/* ============================================================
-   SUBTLE FLOAT ANIMATION on metric gadgets
-   ============================================================ */
+/* ---------- FLOAT ANIMATION ---------- */
 @keyframes aeroFloat {
     0%, 100% { transform: translateY(0px); }
     50%      { transform: translateY(-2px); }
@@ -360,9 +326,7 @@ hr {
 [data-testid="stMetric"]:nth-of-type(3) { animation-delay: 2s; }
 [data-testid="stMetric"]:nth-of-type(4) { animation-delay: 3s; }
 
-/* ============================================================
-   MARKDOWN TEXT
-   ============================================================ */
+/* ---------- TEXT ---------- */
 p, span, div, label {
     color: #0d3a52 !important;
 }
@@ -371,3 +335,161 @@ p, span, div, label {
 }
 </style>
 """
+st.markdown(AERO_CSS, unsafe_allow_html=True)
+
+# ============================================================
+# SECRETS
+# ============================================================
+AIRTABLE_API_KEY = st.secrets["AIRTABLE_API_KEY"]
+BASE_ID = st.secrets["AIRTABLE_BASE_ID"]
+TRADES_ID = st.secrets["AIRTABLE_TABLE_ID"]
+EXITS_ID = st.secrets["AIRTABLE_EXITS_TABLE_ID"]
+FILLS_ID = st.secrets["AIRTABLE_FILLS_TABLE_ID"]
+
+BASE = f"https://api.airtable.com/v0/{BASE_ID}"
+H = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+
+@st.cache_data(ttl=60)
+def fetch(table_id):
+    out, params = [], {}
+    while True:
+        r = requests.get(f"{BASE}/{table_id}", headers=H, params=params, timeout=30)
+        d = r.json()
+        out.extend(d.get("records", []))
+        if not d.get("offset"):
+            break
+        params["offset"] = d["offset"]
+    return [rec["fields"] for rec in out]
+
+# ============================================================
+# HEADER
+# ============================================================
+st.markdown("# 🐋 Whale Bot Dashboard")
+st.markdown(
+    "<p style='color: #0a4a6a; font-size: 1rem; font-weight: 500; "
+    "text-shadow: 0 1px 0 rgba(255,255,255,0.8); margin-top: -0.5rem;'>"
+    "Automated multi-signal trading · Live from Airtable</p>",
+    unsafe_allow_html=True,
+)
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+try:
+    exits_df = pd.DataFrame(fetch(EXITS_ID))
+    trades_df = pd.DataFrame(fetch(TRADES_ID))
+    fills_df = pd.DataFrame(fetch(FILLS_ID))
+except Exception as e:
+    st.error(f"Failed to load Airtable data: {e}")
+    st.stop()
+
+# ============================================================
+# COMPUTE DERIVED COLUMNS
+# ============================================================
+if not fills_df.empty and "Slippage (%)" not in fills_df.columns:
+    if "Slippage ($)" in fills_df.columns and "Expected Price" in fills_df.columns:
+        fills_df["Slippage (%)"] = (
+            fills_df["Slippage ($)"] /
+            fills_df["Expected Price"].replace(0, np.nan)
+        ) * 100
+
+# ============================================================
+# TOP METRICS
+# ============================================================
+c1, c2, c3, c4 = st.columns(4)
+
+if not exits_df.empty and "PnL Dollars" in exits_df.columns:
+    total_pnl = exits_df["PnL Dollars"].sum()
+    wins = (exits_df["PnL Dollars"] > 0).sum()
+    win_rate = wins / len(exits_df) if len(exits_df) else 0
+    c1.metric("Total P/L", f"${total_pnl:,.2f}")
+    c2.metric("Win Rate", f"{win_rate:.0%}")
+else:
+    c1.metric("Total P/L", "$0.00")
+    c2.metric("Win Rate", "—")
+
+open_trades = len(trades_df) - len(exits_df) if not trades_df.empty else 0
+c3.metric("Open Trades", max(open_trades, 0))
+c4.metric("Fills Logged", len(fills_df))
+
+st.markdown("---")
+
+# ============================================================
+# EQUITY CURVE
+# ============================================================
+st.markdown("## 💹 Equity Curve")
+if not exits_df.empty and "PnL Dollars" in exits_df.columns:
+    sorted_exits = exits_df.sort_values("Exit Timestamp").copy()
+    sorted_exits["Cumulative"] = sorted_exits["PnL Dollars"].cumsum()
+    st.line_chart(
+        sorted_exits.set_index("Exit Timestamp")["Cumulative"],
+        height=260,
+    )
+else:
+    st.info("No closed trades yet. The first data point appears after a trade hits its target or stop.")
+
+st.markdown("---")
+
+# ============================================================
+# SIGNAL PERFORMANCE
+# ============================================================
+st.markdown("## 📡 Signal Performance")
+col1, col2 = st.columns(2)
+
+with col1:
+    st.markdown("### Execution Slippage")
+    if not fills_df.empty and "Slippage (%)" in fills_df.columns:
+        slip = fills_df.groupby("Order Type")["Slippage (%)"].agg(["mean", "count"])
+        slip.columns = ["Avg Slippage (%)", "Count"]
+        st.dataframe(slip, use_container_width=True)
+    else:
+        st.info("No fills logged yet.")
+
+with col2:
+    st.markdown("### P/L by Symbol")
+    if not exits_df.empty and "PnL Dollars" in exits_df.columns:
+        by_sym = exits_df.groupby("Symbol")["PnL Dollars"].sum().sort_values()
+        st.bar_chart(by_sym, height=260)
+    else:
+        st.info("No closed trades yet.")
+
+st.markdown("---")
+
+# ============================================================
+# RECENT TABLES
+# ============================================================
+st.markdown("## 📋 Recent Trades")
+if not trades_df.empty:
+    show = ["Timestamp", "Symbol", "Qty", "Price", "Score", "Threshold"]
+    cols = [c for c in show if c in trades_df.columns]
+    if cols:
+        st.dataframe(trades_df[cols].tail(20), use_container_width=True)
+    else:
+        st.info("Trades table has no matching columns yet.")
+else:
+    st.info("🌊 No trades logged yet. The bot will write its first entry when a signal fires.")
+
+st.markdown("## 📋 Recent Exits")
+if not exits_df.empty:
+    show = ["Exit Timestamp", "Symbol", "Exit Reason", "PnL Dollars", "PnL Percent"]
+    cols = [c for c in show if c in exits_df.columns]
+    if cols:
+        st.dataframe(exits_df[cols].tail(20), use_container_width=True)
+    else:
+        st.info("Exits table has no matching columns yet.")
+else:
+    st.info("🌊 No exits yet. This fills in when a trade hits its target or stop-loss.")
+
+st.markdown("---")
+
+# ============================================================
+# FOOTER
+# ============================================================
+st.markdown(
+    "<p style='text-align: center; color: #0a4a6a; font-weight: 500; "
+    "font-size: 0.85rem; text-shadow: 0 1px 0 rgba(255,255,255,0.8); "
+    "padding-top: 2rem;'>"
+    "🐋 Whale Bot · Frutiger Aero Edition · Refreshes every 60s"
+    "</p>",
+    unsafe_allow_html=True,
+   )
