@@ -1,0 +1,44 @@
+name: Run Whale Bot (V3)
+
+on:
+  schedule:
+    - cron: '5,35 14-20 * * 1-5'
+    - cron: '5 21 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-v3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+      - run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run V3
+        env:
+          DRY_RUN: "0"
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
+          AIRTABLE_EXITS_TABLE_ID: ${{ secrets.AIRTABLE_EXITS_TABLE_ID }}
+          AIRTABLE_RUNS_TABLE_ID: ${{ secrets.AIRTABLE_RUNS_TABLE_ID }}
+        run: python bot_v3.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v3-log-${{ github.run_number }}
+          path: |
+            v3_bot.log
+            v3_trade_log.csv
+          retention-days: 30
+          if-no-files-found: ignore
