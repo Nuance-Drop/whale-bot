@@ -10,8 +10,10 @@ from alpaca.trading.requests import (
     MarketOrderRequest, StopOrderRequest, GetOrdersRequest
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+import requests
 import yfinance as yf
 import pandas as pd
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from pyairtable import Api
 
 from common import (
