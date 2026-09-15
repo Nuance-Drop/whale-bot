@@ -1,8 +1,9 @@
 """
 Whale Bot V3 - Backtested strategy. Trades SPY, QQQ, AAPL, MSFT. Trailing stops.
+Fixed: multi-stop accumulation bug in update_trails().
 """
 
-import os, time, logging, traceback
+import os, time, logging
 from datetime import datetime, timezone
 
 from alpaca.trading.client import TradingClient
@@ -39,20 +40,29 @@ def phase(n): L(f"\n===== V3: {n} =====")
 
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
+# ============================================================
+# ORDER HELPERS
+# ============================================================
 def entry_info(sym):
+    """Return (entry_price, entry_time) of most recent filled BUY."""
     req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
     for o in client.get_orders(filter=req):
         if o.symbol == sym and o.side == OrderSide.BUY and o.filled_at:
             return float(o.filled_avg_price), o.filled_at
     return None, None
 
-def open_stop(sym):
+def all_open_stops(sym):
+    """Return ALL open SELL stop orders for a symbol."""
     req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+    stops = []
     for o in client.get_orders(filter=req):
         if o.symbol == sym and o.side == OrderSide.SELL and o.order_type.value == "stop":
-            return o
-    return None
+            stops.append(o)
+    return stops
 
+# ============================================================
+# AIRTABLE LOGGING
+# ============================================================
 def log_entry(sym, qty, price, stop, score):
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]): return
@@ -100,47 +110,105 @@ def log_exits_from_broker():
             log_exit(o.symbol, ep, xp, q, peak)
     except Exception as e: L(f"⚠️ log exits: {e}")
 
+# ============================================================
+# TRAILING STOP MANAGER (FIXED — handles duplicate stops)
+# ============================================================
 def update_trails():
-    for p in client.get_all_positions():
+    positions = client.get_all_positions()
+    if not positions:
+        L("No open positions.")
+        return
+
+    for p in positions:
         sym = p.symbol
         if sym not in WATCHLIST: continue
         q = int(float(p.qty))
         ep, et = entry_info(sym)
-        if ep is None or et is None: continue
+        if ep is None or et is None:
+            L(f"  {sym}: no entry info, skipping")
+            continue
+
         peak = get_peak_since(sym, et) or ep
         init = ep * (1 - INITIAL_STOP_PCT)
         trail = peak * (1 - TRAIL_PCT)
         target = round(max(init, trail), 2)
-        cur = open_stop(sym)
-        cs = float(cur.stop_price) if cur and cur.stop_price else None
-        L(f"  {sym}: entry ${ep:.2f} peak ${peak:.2f} target ${target:.2f} cur ${cs}")
-        if cs is not None and cs >= target: continue
-        if run_is_dry():
-            L(f"  {sym}: DRY would update stop ${cs} → ${target}")
-            continue
-        if cur:
-            try: client.cancel_order_by_id(cur.id)
-            except Exception as e: L(f"  cancel: {e}")
-        try:
-            client.submit_order(StopOrderRequest(symbol=sym, qty=q, side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC, stop_price=target))
-            L(f"  {sym}: new stop ${target}")
-        except Exception as e: L(f"  stop: {e}")
 
+        stops = all_open_stops(sym)
+        stop_prices = [float(s.stop_price) for s in stops if s.stop_price]
+        tightest = max(stop_prices) if stop_prices else None
+
+        L(f"  {sym}: entry ${ep:.2f} peak ${peak:.2f} target ${target:.2f} "
+          f"stops={stop_prices}")
+
+        # Duplicate detection — cancel extras first
+        if len(stops) > 1:
+            L(f"  🚨 {sym}: found {len(stops)} stops, cancelling extras")
+            for s in stops:
+                try:
+                    client.cancel_order_by_id(s.id)
+                    L(f"  {sym}: cancelled stop @ ${s.stop_price}")
+                except Exception as e:
+                    L(f"  {sym}: cancel failed: {e}")
+            time.sleep(2)
+            stops = []
+            tightest = None
+
+        # If tightest stop is already tight enough, we're done
+        if tightest is not None and tightest >= target:
+            L(f"  {sym}: existing stop ${tightest} already tight enough")
+            continue
+
+        # Cancel the current stop (if any) before placing new one
+        if stops:
+            for s in stops:
+                try:
+                    client.cancel_order_by_id(s.id)
+                    L(f"  {sym}: cancelled stop @ ${s.stop_price}")
+                except Exception as e:
+                    L(f"  {sym}: cancel failed: {e}")
+            time.sleep(2)
+
+        if run_is_dry():
+            L(f"  {sym}: DRY would place stop ${target}")
+            continue
+
+        # Place exactly ONE new stop
+        try:
+            client.submit_order(StopOrderRequest(
+                symbol=sym, qty=q, side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC, stop_price=target
+            ))
+            L(f"  {sym}: new stop placed @ ${target}")
+        except Exception as e:
+            L(f"  ❌ {sym}: stop placement failed: {e}")
+
+# ============================================================
+# ENTRY LOGIC
+# ============================================================
 def try_entry():
     if not is_market_bullish():
-        L("regime: below 200MA"); return "no_signal"
-    a = client.get_account(); eq = float(a.equity)
+        L("regime: below 200MA")
+        return "no_signal"
+
+    a = client.get_account()
+    eq = float(a.equity)
     pos = client.get_all_positions()
     held = [p.symbol for p in pos]
-    if len(pos) >= MAX_POSITIONS: return "skipped"
+    if len(pos) >= MAX_POSITIONS:
+        L(f"max positions ({len(pos)})")
+        return "skipped"
     total = sum(float(p.market_value) for p in pos)
     cap = eq * TACTICAL_LIMIT_PCT
-    if total >= cap: return "skipped"
+    if total >= cap:
+        L(f"tactical cap (${total:.2f} / ${cap:.2f})")
+        return "skipped"
+
     for sym in WATCHLIST:
-        if sym in held: continue
+        if sym in held:
+            continue
         rsi, close, sma = get_rsi_sma(sym)
-        if rsi is None: continue
+        if rsi is None:
+            continue
         L(f"  {sym}: RSI {rsi:.1f} Close ${close:.2f} SMA50 ${sma:.2f}")
         if 35 < rsi < 55 and close > sma:
             stop = round(close * (1 - INITIAL_STOP_PCT), 2)
@@ -148,24 +216,30 @@ def try_entry():
             risk = eq * RISK_PER_TRADE
             rps = close * INITIAL_STOP_PCT
             qty = min(int(risk/rps), int(remaining/close))
-            if qty < 1: continue
-            L(f"🎯 V3 entry {sym} qty {qty} @ ${close:.2f}")
+            if qty < 1:
+                continue
+            L(f"🎯 V3 ENTRY {sym} qty {qty} @ ${close:.2f} stop ${stop}")
             if run_is_dry():
                 L(f"🟡 DRY would buy {sym}")
                 send_telegram(f"🟡 *v3 DRY*: {sym} {qty} @ ${close:.2f}")
                 return "traded"
             try:
                 order = client.submit_order(MarketOrderRequest(
-                    symbol=sym, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                    symbol=sym, qty=qty, side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY
+                ))
                 actual = close
                 for _ in range(15):
                     time.sleep(2)
                     f = client.get_order_by_id(order.id)
                     if f.status.value == "filled":
-                        actual = float(f.filled_avg_price or close); break
+                        actual = float(f.filled_avg_price or close)
+                        break
                 real_stop = round(actual * (1 - INITIAL_STOP_PCT), 2)
-                client.submit_order(StopOrderRequest(symbol=sym, qty=qty, side=OrderSide.SELL,
-                    time_in_force=TimeInForce.GTC, stop_price=real_stop))
+                client.submit_order(StopOrderRequest(
+                    symbol=sym, qty=qty, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC, stop_price=real_stop
+                ))
                 L(f"  ✅ filled ${actual:.2f} stop ${real_stop}")
                 log_entry(sym, qty, actual, real_stop, 3)
                 send_telegram(f"🚨 *v3*: {sym} {qty} @ ${actual:.2f}\nStop ${real_stop}")
@@ -177,31 +251,51 @@ def try_entry():
     L("no V3 signals")
     return "no_signal"
 
+# ============================================================
+# MAIN
+# ============================================================
 def run():
     L("="*60); L(f"v3 start {datetime.now().isoformat()}")
     if not is_market_open():
-        L("market closed"); log_run("v3", "market_closed"); return
+        L("market closed")
+        log_run("v3", "market_closed")
+        return
+
     L("--- drawdown ---")
     if drawdown_check(client, 0.05, L):
-        log_run("v3", "error", error="drawdown halt"); return
+        log_run("v3", "error", error="drawdown halt")
+        return
+
     L("--- trails ---")
-    try: update_trails()
-    except Exception as e: L(f"trails: {e}")
+    try:
+        update_trails()
+    except Exception as e:
+        L(f"trails: {e}")
+
     L("--- exits ---")
-    try: log_exits_from_broker()
-    except Exception as e: L(f"exits: {e}")
+    try:
+        log_exits_from_broker()
+    except Exception as e:
+        L(f"exits: {e}")
+
     L("--- entry ---")
     try:
         status = try_entry()
         try:
             a = client.get_account()
-            log_run("v3", status, equity=float(a.equity), positions=len(client.get_all_positions()))
-        except Exception: log_run("v3", status)
+            log_run("v3", status, equity=float(a.equity),
+                    positions=len(client.get_all_positions()))
+        except Exception:
+            log_run("v3", status)
     except Exception as e:
-        L(f"entry: {e}"); log_run("v3", "error", error=str(e))
+        L(f"entry: {e}")
+        log_run("v3", "error", error=str(e))
+
     L("="*60)
 
 if __name__ == "__main__":
-    try: run()
+    try:
+        run()
     except Exception as e:
-        L(f"❌ FATAL: {e}"); send_telegram(f"❌ v3 fatal: {e}")
+        L(f"❌ FATAL: {e}")
+        send_telegram(f"❌ v3 fatal: {e}")
