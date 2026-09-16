@@ -1,6 +1,6 @@
 """
 Whale Bot V3 - Backtested strategy. Trades SPY, QQQ, AAPL, MSFT. Trailing stops.
-Fixed: multi-stop accumulation bug in update_trails().
+Fixed: multi-stop accumulation bug. Source attribution. Auto-halt on failures.
 """
 
 import os, time, logging
@@ -17,7 +17,8 @@ from pyairtable import Api
 
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
-    drawdown_check, get_rsi_sma, get_peak_since, run_is_dry
+    drawdown_check, get_rsi_sma, get_peak_since, run_is_dry, should_halt,
+    http_get, http_post
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -44,7 +45,6 @@ client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 # ORDER HELPERS
 # ============================================================
 def entry_info(sym):
-    """Return (entry_price, entry_time) of most recent filled BUY."""
     req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
     for o in client.get_orders(filter=req):
         if o.symbol == sym and o.side == OrderSide.BUY and o.filled_at:
@@ -52,7 +52,6 @@ def entry_info(sym):
     return None, None
 
 def all_open_stops(sym):
-    """Return ALL open SELL stop orders for a symbol."""
     req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
     stops = []
     for o in client.get_orders(filter=req):
@@ -84,7 +83,8 @@ def log_exit(sym, entry, exit_price, qty, peak=None):
             "Entry Price": round(entry, 2), "Exit Price": round(exit_price, 2),
             "Qty": qty, "Exit Reason": "STOP_LOSS",
             "PnL Dollars": round(pd_, 2), "PnL Percent": round(pp_, 2),
-            "Signals That Fired": "v3", "Signal Score": 3, "Signal Threshold": 3
+            "Signals That Fired": "v3", "Signal Score": 3, "Signal Threshold": 3,
+            "Source": "v3"
         }
         if peak: payload["Peak Price"] = round(peak, 4)
         Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID).create(payload)
@@ -111,7 +111,7 @@ def log_exits_from_broker():
     except Exception as e: L(f"⚠️ log exits: {e}")
 
 # ============================================================
-# TRAILING STOP MANAGER (FIXED — handles duplicate stops)
+# TRAILING STOP MANAGER (FIXED)
 # ============================================================
 def update_trails():
     positions = client.get_all_positions()
@@ -137,10 +137,8 @@ def update_trails():
         stop_prices = [float(s.stop_price) for s in stops if s.stop_price]
         tightest = max(stop_prices) if stop_prices else None
 
-        L(f"  {sym}: entry ${ep:.2f} peak ${peak:.2f} target ${target:.2f} "
-          f"stops={stop_prices}")
+        L(f"  {sym}: entry ${ep:.2f} peak ${peak:.2f} target ${target:.2f} stops={stop_prices}")
 
-        # Duplicate detection — cancel extras first
         if len(stops) > 1:
             L(f"  🚨 {sym}: found {len(stops)} stops, cancelling extras")
             for s in stops:
@@ -153,12 +151,10 @@ def update_trails():
             stops = []
             tightest = None
 
-        # If tightest stop is already tight enough, we're done
         if tightest is not None and tightest >= target:
             L(f"  {sym}: existing stop ${tightest} already tight enough")
             continue
 
-        # Cancel the current stop (if any) before placing new one
         if stops:
             for s in stops:
                 try:
@@ -172,7 +168,6 @@ def update_trails():
             L(f"  {sym}: DRY would place stop ${target}")
             continue
 
-        # Place exactly ONE new stop
         try:
             client.submit_order(StopOrderRequest(
                 symbol=sym, qty=q, side=OrderSide.SELL,
@@ -259,6 +254,11 @@ def run():
     if not is_market_open():
         L("market closed")
         log_run("v3", "market_closed")
+        return
+
+    if should_halt("v3"):
+        L("🛑 halted due to consecutive failures")
+        log_run("v3", "error", error="halted due to consecutive failures")
         return
 
     L("--- drawdown ---")
