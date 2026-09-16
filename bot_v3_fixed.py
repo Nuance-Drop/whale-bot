@@ -1,6 +1,6 @@
 """
-Whale Bot v3_fixed - V3 entries (SPY/QQQ/AAPL/MSFT) with FIXED bracket exits.
-This isolates entry quality from exit quality: compare v3 vs v3_fixed.
+Whale Bot v3_fixed - V3 entries with FIXED bracket exits.
+Isolates entry quality from exit quality.
 """
 
 import os, time, logging
@@ -16,7 +16,7 @@ from pyairtable import Api
 
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
-    drawdown_check, get_rsi_sma, run_is_dry
+    drawdown_check, get_rsi_sma, run_is_dry, should_halt, http_get, http_post
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -77,7 +77,8 @@ def log_exits_from_broker():
                 "Entry Price": round(ep, 2), "Exit Price": round(xp, 2),
                 "Qty": q, "Exit Reason": reason,
                 "PnL Dollars": round(pd_, 2), "PnL Percent": round(pp_, 2),
-                "Signals That Fired": "v3_fixed", "Signal Score": 3, "Signal Threshold": 3
+                "Signals That Fired": "v3_fixed", "Signal Score": 3, "Signal Threshold": 3,
+                "Source": "v3_fixed"
             })
             L(f"📕 v3_fixed exit {o.symbol}: ${pd_:.2f}")
             send_telegram(f"📕 *v3_fixed exit*: {o.symbol} | ${pd_:.2f}")
@@ -130,10 +131,18 @@ def run():
     L("="*60); L(f"v3_fixed start {datetime.now().isoformat()}")
     if not is_market_open():
         L("market closed"); log_run("v3_fixed", "market_closed"); return
+
+    if should_halt("v3_fixed"):
+        L("🛑 halted due to consecutive failures")
+        log_run("v3_fixed", "error", error="halted due to consecutive failures")
+        return
+
     if drawdown_check(client, 0.05, L):
         log_run("v3_fixed", "error", error="drawdown halt"); return
+
     try: log_exits_from_broker()
     except Exception as e: L(f"exits: {e}")
+
     status = "error"
     try:
         status = try_entry()
