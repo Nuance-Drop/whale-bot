@@ -153,10 +153,8 @@ def log_reflexive(vix_struct, cross_corr, spy_vix_corr, vol_z, intensity, notes)
 def run():
     L("="*60)
     L(f"reflexive start {datetime.now().isoformat()}")
-    if not is_market_open():
-        L("market closed")
-        log_run("reflexive", "market_closed")
-        return
+    # Reflexive data is valid 24/7 — no market hours gate
+pass
 
     vix_struct = get_vix_term_structure()
     cross_corr = get_cross_correlation()
