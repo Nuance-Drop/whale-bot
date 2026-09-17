@@ -1,8 +1,34 @@
-alpaca-py
-yfinance
-pandas
-numpy
-vaderSentiment
-requests
-pyairtable
-cryptography
+# ============================================================
+# Whale Bot — Full Dependency List
+# ============================================================
+
+# Trading
+alpaca-py>=0.44.0
+
+# Market data
+yfinance>=1.7.0
+
+# Data manipulation
+pandas>=3.0.0
+numpy>=2.0.0
+
+# Sentiment analysis
+vaderSentiment>=3.3.2
+
+# HTTP requests
+requests>=2.31.0
+
+# Airtable
+pyairtable>=3.4.0
+
+# Kalshi API signing
+cryptography>=50.0.0
+
+# Unit testing
+pytest>=8.0.0
+
+# ============================================================
+# Astrology (optional — if Vedaksha install fails, astro bot
+# will still run with OpenEphemeris only)
+# ============================================================
+vedaksha>=0.1.0
