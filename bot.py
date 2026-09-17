@@ -1,6 +1,7 @@
 """
-Whale Bot v10 - Full 8-signal trading.
+Whale Bot v10 - Full 8-signal trading with adaptive Thompson Sampling weights.
 Trades NVDA, GOOGL, META, AMZN. Max 2 positions, 10% tactical cap.
+Stores signal breakdown at entry, updates MAB on exit.
 """
 
 import os, csv, time, json, logging, traceback
@@ -22,6 +23,17 @@ from common import (
     is_market_bullish, drawdown_check, get_vix, spy_strength_pct,
     get_rsi_sma, run_is_dry, should_halt, http_get, http_post
 )
+
+# ---- adaptive allocator ----
+try:
+    from adaptive_allocator import get_allocator, SIGNALS
+except ImportError:
+    SIGNALS = ["regime", "rsi", "sma", "sentiment", "congress", "insider", "pead", "flow"]
+    def get_allocator():
+        class _Noop:
+            def apply_to_score(self, sigs): return sum(1 for v in sigs.values() if v)
+            def update(self, sigs, pnl): pass
+        return _Noop()
 
 # ---- config ----
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -60,7 +72,9 @@ W = load_weights()
 analyzer = SentimentIntensityAnalyzer()
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
-# ---- kalshi ----
+# ============================================================
+# KALSHI MACRO OVERLAY
+# ============================================================
 KALSHI_URL = "https://external-api.kalshi.com/trade-api/v2"
 def kalshi_macro():
     try:
@@ -77,7 +91,9 @@ def kalshi_macro():
         return 0
     except Exception: return 0
 
-# ---- signals ----
+# ============================================================
+# SIGNALS
+# ============================================================
 def congress_sig(sym):
     try:
         if not BARGO_API_KEY: return False
@@ -131,25 +147,63 @@ def senti_sig(sym):
         return (sum(s)/len(s)) > 0.1 if s else False
     except Exception: return False
 
+# ============================================================
+# SCORING — static + adaptive blended
+# ============================================================
 def calc_score(sym):
-    score = 0; sigs = {}
-    if not is_market_bullish(): return 0, {"regime": False}
-    score += W.get("regime",1.0); sigs['regime'] = True
+    """
+    Compute composite score.
+    Static component uses SIGNAL_WEIGHTS from signal_weights.json.
+    Adaptive component uses Thompson Sampling from adaptive_allocator.
+    Final score is a 50/50 blend until MAB has enough data.
+    """
+    score = 0.0
+    sigs = {}
+
+    # Regime gate
+    if not is_market_bullish():
+        return 0, {"regime": False}
+
+    score += W.get("regime", 1.0); sigs['regime'] = True
+
     k = kalshi_macro()
     if k: score += k; sigs['kalshi'] = k
+
     rsi, close, sma = get_rsi_sma(sym)
     if rsi is not None:
-        if 35 < rsi < 55: score += W.get("rsi",1.0); sigs['rsi'] = True
-        if close > sma: score += W.get("sma",1.0); sigs['sma'] = True
+        if 35 < rsi < 55: score += W.get("rsi", 1.0); sigs['rsi'] = True
+        if close > sma: score += W.get("sma", 1.0); sigs['sma'] = True
         L(f"  {sym}: RSI {rsi:.1f} Close ${close:.2f} SMA50 ${sma:.2f}")
-    if senti_sig(sym): score += W.get("sentiment",1.0); sigs['sentiment'] = True
-    if congress_sig(sym): score += W.get("congress",2.0); sigs['congress'] = True
-    if insider_sig(sym): score += W.get("insider",2.0); sigs['insider'] = True
-    if pead_sig(sym): score += W.get("pead",1.0); sigs['pead'] = True
-    if flow_sig(sym): score += W.get("flow",2.0); sigs['flow'] = True
-    L(f"  {sym} SCORE {score:.2f} | {sigs}")
-    return score, sigs
 
+    if senti_sig(sym): score += W.get("sentiment", 1.0); sigs['sentiment'] = True
+    if congress_sig(sym): score += W.get("congress", 2.0); sigs['congress'] = True
+    if insider_sig(sym): score += W.get("insider", 2.0); sigs['insider'] = True
+    if pead_sig(sym): score += W.get("pead", 1.0); sigs['pead'] = True
+    if flow_sig(sym): score += W.get("flow", 2.0); sigs['flow'] = True
+
+    # Adaptive overlay
+    try:
+        allocator = get_allocator()
+        adaptive_score = allocator.apply_to_score(sigs)
+        # Blend: 50% static, 50% adaptive until MAB has enough data
+        confidence = sum(
+            allocator.get_confidence(s) for s in SIGNALS if hasattr(allocator, 'get_confidence')
+        ) if hasattr(allocator, 'get_confidence') else 0
+        if confidence >= 20:
+            blend = 0.3  # 30% static, 70% adaptive once trained
+        else:
+            blend = 0.5  # 50/50 during training
+        final_score = (blend * score) + ((1 - blend) * adaptive_score)
+        L(f"  {sym} STATIC {score:.2f} | ADAPTIVE {adaptive_score:.2f} | FINAL {final_score:.2f} | {sigs}")
+        return final_score, sigs
+    except Exception as e:
+        L(f"  ⚠️ MAB overlay failed: {e}, using static only")
+        L(f"  {sym} SCORE {score:.2f} | {sigs}")
+        return score, sigs
+
+# ============================================================
+# DYNAMIC THRESHOLD
+# ============================================================
 def dyn_threshold(n):
     t = 4.0; reasons = []
     rs = spy_strength_pct()
@@ -185,7 +239,9 @@ def atr_mult(sym, lb=20):
         return max(0.5, min(m/a, 1.5))
     except Exception: return 1.0
 
-# ---- airtable ----
+# ============================================================
+# AIRTABLE LOGGING
+# ============================================================
 def log_entry(sym, qty, price, stop, target, score, th, sigs):
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]): return
@@ -196,23 +252,33 @@ def log_entry(sym, qty, price, stop, target, score, th, sigs):
         })
     except Exception as e: L(f"⚠️ entry log: {e}")
 
-def log_exit(sym, entry, exit_price, qty, reason, peak=None):
+def log_exit(sym, entry, exit_price, qty, reason, peak=None, sigs=None, pnl_pct=None):
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
         pnl_d = (exit_price - entry) * qty
-        pnl_p = (exit_price - entry) / entry * 100
+        pnl_p = (exit_price - entry) / entry * 100 if entry else 0
         payload = {
             "Exit Timestamp": datetime.now().isoformat(), "Symbol": sym,
             "Entry Price": round(entry, 2), "Exit Price": round(exit_price, 2),
             "Qty": qty, "Exit Reason": reason,
             "PnL Dollars": round(pnl_d, 2), "PnL Percent": round(pnl_p, 2),
-            "Signals That Fired": "v10", "Signal Score": 0, "Signal Threshold": 0,
+            "Signals That Fired": json.dumps(sigs) if sigs else "",
+            "Signal Score": 0, "Signal Threshold": 0,
             "Source": "v10"
         }
         if peak: payload["Peak Price"] = round(peak, 4)
         Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID).create(payload)
         L(f"📕 exit {sym}: ${pnl_d:.2f}")
         send_telegram(f"📕 *v10 exit*: {sym} | ${pnl_d:.2f}")
+
+        # ---- Update MAB with realized outcome ----
+        if sigs:
+            try:
+                allocator = get_allocator()
+                allocator.update(sigs, pnl_p)
+                L(f"  🧠 MAB updated with {sym} outcome ({pnl_p:+.2f}%)")
+            except Exception as e:
+                L(f"  ⚠️ MAB update failed: {e}")
     except Exception as e: L(f"⚠️ exit log: {e}")
 
 def log_fill(sym, otype, exp, actual, oid=None):
@@ -226,6 +292,24 @@ def log_fill(sym, otype, exp, actual, oid=None):
             "Order ID": str(oid or "")
         })
     except Exception as e: L(f"⚠️ fill log: {e}")
+
+def _find_signal_breakdown_in_trades(sym):
+    """Look up the signal breakdown from the most recent entry for this symbol."""
+    try:
+        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]):
+            return None
+        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID)
+        rows = table.all(formula=f"{{Symbol}}='{sym}'", sort=["-Timestamp"])
+        for r in rows[:5]:
+            sb = r['fields'].get('Signal Breakdown')
+            if sb:
+                try:
+                    return json.loads(sb)
+                except Exception:
+                    pass
+        return None
+    except Exception:
+        return None
 
 def log_exits_from_broker():
     try:
@@ -249,9 +333,14 @@ def log_exits_from_broker():
                 if o.order_type.value == "stop": reason = "STOP_LOSS"
                 elif o.order_type.value == "limit": reason = "TAKE_PROFIT"
             except Exception: pass
-            log_exit(o.symbol, ep, xp, q, reason)
+            # Retrieve original signal breakdown for MAB update
+            sigs = _find_signal_breakdown_in_trades(o.symbol)
+            log_exit(o.symbol, ep, xp, q, reason, sigs=sigs)
     except Exception as e: L(f"⚠️ log_exits: {e}")
 
+# ============================================================
+# EXECUTION
+# ============================================================
 def place_bracket(sym, qty, entry, score, th, sigs, mult):
     stop = round(entry*(1-STOP_LOSS_PCT), 2)
     target = round(entry*1.05, 2)
@@ -282,6 +371,9 @@ def place_bracket(sym, qty, entry, score, th, sigs, mult):
         L(f"❌ order: {e}")
         log_run("v10", "error", top_candidate=sym, error=str(e))
 
+# ============================================================
+# MAIN
+# ============================================================
 def run():
     L("="*60); L(f"v10 start {datetime.now().isoformat()}")
     if not is_market_open():
