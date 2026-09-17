@@ -27,8 +27,4 @@ cryptography>=50.0.0
 # Unit testing
 pytest>=8.0.0
 
-# ============================================================
-# Astrology (optional — if Vedaksha install fails, astro bot
-# will still run with OpenEphemeris only)
-# ============================================================
-vedaksha>=0.1.0
+pyswisseph>=2.10.0
