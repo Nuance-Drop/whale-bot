@@ -251,10 +251,8 @@ def run():
     L("=" * 60)
     L(f"astro start {datetime.now().isoformat()}")
 
-    if not is_market_open():
-        L("market closed")
-        log_run("astro", "market_closed")
-        return
+    # Astro data is valid 24/7 — no market hours gate
+pass
 
     dt = datetime.now(timezone.utc)
 
