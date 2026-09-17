@@ -1,0 +1,41 @@
+name: Run Astro Bot
+
+on:
+  schedule:
+    - cron: '20,50 14-20 * * 1-5'
+    - cron: '20 21 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-astro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+      - run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install vedaksha || echo "Vedaksha optional"
+      - name: Run Astro
+        env:
+          OPENEPHEMERIS_API_KEY: ${{ secrets.OPENEPHEMERIS_API_KEY }}
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_ASTRO_TABLE_ID: ${{ secrets.AIRTABLE_ASTRO_TABLE_ID }}
+          AIRTABLE_RUNS_TABLE_ID: ${{ secrets.AIRTABLE_RUNS_TABLE_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOCAL_LAT: ${{ secrets.LOCAL_LAT }}
+          LOCAL_LON: ${{ secrets.LOCAL_LON }}
+        run: python bot_astro.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: astro-log-${{ github.run_number }}
+          path: astro_bot.log
+          retention-days: 30
