@@ -1,6 +1,7 @@
 """
 Whale Bot Astro - Logs astrology signals to Airtable. Does NOT trade.
 Uses OpenEphemeris (free tier) + Vedaksha for Vedic calculations.
+Runs 24/7 — no market hours gate.
 """
 
 import os, json, time, logging, requests
@@ -15,16 +16,12 @@ from common import (
     is_market_open, http_get, http_post, clean_for_json
 )
 
-# ============================================================
-# CONFIG
-# ============================================================
 OPENEPHEMERIS_API_KEY = os.environ.get("OPENEPHEMERIS_API_KEY")
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
 AIRTABLE_ASTRO_TABLE_ID = os.environ.get("AIRTABLE_ASTRO_TABLE_ID")
 AIRTABLE_RUNS_TABLE_ID = os.environ.get("AIRTABLE_RUNS_TABLE_ID")
 
-# Reference locations
 NYSE_LAT = 40.7069
 NYSE_LON = -74.0113
 LOCAL_LAT = float(os.environ.get("LOCAL_LAT", "0"))
@@ -35,15 +32,6 @@ OE_BASE = "https://api.openephemeris.com"
 log = get_logger("astro", "astro_bot.log")
 def L(m): print(m); log.info(m)
 
-client = None  # Astro bot does not trade
-
-# ============================================================
-# HIERARCHY SCORING
-# ============================================================
-# Based on published research on planetary effects on markets.
-# Tier 1 (3 points): Saturn, Jupiter, Moon
-# Tier 2 (2 points): Mars, Venus, Mercury
-# Tier 3 (1 point): Sun, outer planets
 TIER_1 = ["saturn", "jupiter", "moon"]
 TIER_2 = ["mars", "venus", "mercury"]
 TIER_3 = ["sun", "uranus", "neptune", "pluto"]
@@ -56,7 +44,6 @@ def get_planet_weight(planet_name):
     return 0.5
 
 def aspect_score(aspect_type):
-    """Score aspects by type. Conjunctions and oppositions are strongest."""
     a = aspect_type.lower()
     if "conjunction" in a: return 1.0
     if "opposition" in a: return 0.9
@@ -65,13 +52,8 @@ def aspect_score(aspect_type):
     if "sextile" in a: return 0.4
     return 0.2
 
-# ============================================================
-# OPENEPHEMERIS API CALLS
-# ============================================================
 def fetch_positions(dt_utc, lat, lon):
-    """Fetch all planetary positions for a given datetime and location."""
     try:
-        # Vedic chart includes Western positions too
         r = http_post(
             f"{OE_BASE}/vedic/chart",
             headers={"Authorization": f"Bearer {OPENEPHEMERIS_API_KEY}"},
@@ -90,7 +72,6 @@ def fetch_positions(dt_utc, lat, lon):
         return None
 
 def fetch_aspects(dt_utc):
-    """Fetch aspects between planets."""
     try:
         r = http_post(
             f"{OE_BASE}/ephemeris/aspects",
@@ -118,14 +99,9 @@ def fetch_moon_phase(dt_utc):
         L(f"⚠️ OE moon error: {e}")
         return {}
 
-# ============================================================
-# VEDAKSHA (self-hosted, optional)
-# ============================================================
 def get_vedaksha_data(dt_utc, lat, lon):
-    """Vedic calculations via Vedaksha. Returns {} if not installed."""
     try:
         import vedaksha
-        # Vedaksha API: chart(datetime, lat, lon) returns kundali data
         chart = vedaksha.chart(
             dt_utc.strftime("%Y-%m-%d %H:%M:%S"),
             lat, lon
@@ -142,15 +118,10 @@ def get_vedaksha_data(dt_utc, lat, lon):
         L(f"⚠️ Vedaksha error: {e}")
         return {}
 
-# ============================================================
-# SCORING
-# ============================================================
 def compute_astro_score(positions, aspects, moon_phase):
-    """Compute composite astrology score using hierarchy."""
     score = 0.0
     breakdown = {}
 
-    # Moon phase (Tier 1)
     illumination = moon_phase.get("illumination", 0)
     if illumination > 50:
         score += 1.5
@@ -159,16 +130,14 @@ def compute_astro_score(positions, aspects, moon_phase):
         score -= 1.0
         breakdown["moon_new"] = -1.0
 
-    # Aspects (Tier 1-3)
     for asp in aspects:
         p1 = asp.get("planet1", "").lower()
         p2 = asp.get("planet2", "").lower()
         atype = asp.get("aspect", "")
         w1 = get_planet_weight(p1)
         w2 = get_planet_weight(p2)
-        a_score = aspect_score(atype)
-        contribution = (w1 + w2) * a_score * 0.5
-        # Determine sign: trine/sextile positive, square/opposition negative
+        a_s = aspect_score(atype)
+        contribution = (w1 + w2) * a_s * 0.5
         if "trine" in atype.lower() or "sextile" in atype.lower():
             score += contribution
         elif "square" in atype.lower() or "opposition" in atype.lower():
@@ -177,7 +146,6 @@ def compute_astro_score(positions, aspects, moon_phase):
             score += contribution * 0.3
         breakdown[f"{p1}_{p2}_{atype}"] = round(contribution, 2)
 
-    # Retrograde flags
     for planet in ["mercury", "venus", "mars", "jupiter", "saturn"]:
         retro = False
         for pos in positions.get("planets", []):
@@ -185,25 +153,19 @@ def compute_astro_score(positions, aspects, moon_phase):
                 retro = pos.get("is_retrograde", False)
                 break
         if retro:
-            # Research: Mercury retrograde = -3.22% annual market returns
             penalty = -1.5 if planet == "mercury" else -0.5
             score += penalty
             breakdown[f"{planet}_retrograde"] = penalty
 
-    # Normalize to [-10, +10]
     score = max(-10, min(10, score))
     return round(score, 2), breakdown
 
-# ============================================================
-# AIRTABLE LOGGING
-# ============================================================
 def log_astro(reference, positions, aspects, moon_phase, vedic, score, breakdown):
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_ASTRO_TABLE_ID]):
             return
         table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_ASTRO_TABLE_ID)
 
-        # Extract key values from positions
         planets = {p.get("name", "").lower(): p for p in positions.get("planets", [])}
         sun = planets.get("sun", {})
         moon = planets.get("moon", {})
@@ -223,9 +185,9 @@ def log_astro(reference, positions, aspects, moon_phase, vedic, score, breakdown
             "Moon_Sign": moon.get("sign_name", ""),
             "Moon_Phase": moon_phase.get("phase", ""),
             "Moon_Illumination": round(moon_phase.get("illumination", 0), 2),
-            "Mercury_Retrograde": merc.get("is_retrograde", False),
-            "Venus_Retrograde": ven.get("is_retrograde", False),
-            "Mars_Retrograde": mars.get("is_retrograde", False),
+            "Mercury_Retrograde": bool(merc.get("is_retrograde", False)),
+            "Venus_Retrograde": bool(ven.get("is_retrograde", False)),
+            "Mars_Retrograde": bool(mars.get("is_retrograde", False)),
             "Jupiter_Sign": jup.get("sign_name", ""),
             "Jupiter_Degree": round(jup.get("sign_longitude", 0), 2),
             "Saturn_Sign": sat.get("sign_name", ""),
@@ -244,23 +206,17 @@ def log_astro(reference, positions, aspects, moon_phase, vedic, score, breakdown
     except Exception as e:
         L(f"⚠️ Astro log failed: {e}")
 
-# ============================================================
-# MAIN
-# ============================================================
 def run():
     L("=" * 60)
     L(f"astro start {datetime.now().isoformat()}")
 
-    # Astro data is valid 24/7 — no market hours gate
-pass
-
     dt = datetime.now(timezone.utc)
 
-    # Fetch data for both reference points
     for ref, lat, lon in [("NYSE", NYSE_LAT, NYSE_LON), ("Local", LOCAL_LAT, LOCAL_LON)]:
         L(f"--- {ref} ---")
         positions = fetch_positions(dt, lat, lon)
         if not positions:
+            L(f"⚠️ No positions for {ref}")
             continue
         aspects = fetch_aspects(dt)
         moon_phase = fetch_moon_phase(dt)
