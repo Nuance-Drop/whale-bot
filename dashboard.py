@@ -1,6 +1,6 @@
 """
-Whale Bot Dashboard v8 — Live Trading + Research Lab with animated visualizer
-and LLM-narrated status interpretation.
+Whale Bot Dashboard v9 — Live Trading + Research Lab.
+Fixed attribution via Source column. Net P/L after fees.
 """
 
 import streamlit as st
@@ -11,9 +11,6 @@ from datetime import datetime
 st.set_page_config(page_title="Whale Bot", page_icon="🐋", layout="wide",
                    initial_sidebar_state="collapsed")
 
-# ============================================================
-# PARENT PAGE CSS
-# ============================================================
 st.markdown("""
 <style>
 #MainMenu, footer, header { visibility: hidden !important; }
@@ -32,9 +29,6 @@ iframe { width: 100% !important; max-width: 100vw !important; display: block !im
 </style>
 """, unsafe_allow_html=True)
 
-# ============================================================
-# SECRETS
-# ============================================================
 AIRTABLE_API_KEY = st.secrets["AIRTABLE_API_KEY"]
 BASE_ID = st.secrets["AIRTABLE_BASE_ID"]
 TRADES_ID = st.secrets["AIRTABLE_TABLE_ID"]
@@ -69,9 +63,6 @@ def clean_for_json(obj):
     if isinstance(obj, list): return [clean_for_json(x) for x in obj]
     return obj
 
-# ============================================================
-# TABS
-# ============================================================
 tab_live, tab_research = st.tabs(["📊 Live Trading", "✨ Research Lab"])
 
 # ============================================================
@@ -93,6 +84,9 @@ with tab_live:
             if ep: f["Slippage (%)"] = round((f["Slippage ($)"]/ep)*100, 4)
 
     total_pnl = sum(e.get("PnL Dollars", 0) for e in exits)
+    total_fees = sum(e.get("Fees", 0) for e in exits)
+    net_pnl = total_pnl - total_fees
+
     wins = sum(1 for e in exits if e.get("PnL Dollars", 0) > 0)
     win_rate = (wins/len(exits)*100) if exits else 0
     open_trades = max(len(trades) - len(exits), 0)
@@ -100,7 +94,7 @@ with tab_live:
     exits_sorted = sorted(exits, key=lambda x: x.get("Exit Timestamp", ""))
     cum = 0; equity_points = []
     for e in exits_sorted:
-        cum += e.get("PnL Dollars", 0)
+        cum += e.get("PnL Dollars", 0) - e.get("Fees", 0)
         equity_points.append({"t": e.get("Exit Timestamp", ""), "v": round(cum, 2)})
 
     by_symbol = {}
@@ -115,8 +109,27 @@ with tab_live:
         for k in signal_fires:
             if s.get(k.capitalize()) or s.get(k): signal_fires[k] += 1
 
+    # --- ATTRIBUTION FIX: read Source column, fallback to Signal Breakdown ---
+    def detect_source(record):
+        src = record.get("Source", "")
+        if src:
+            return str(src).lower()
+        sb = record.get("Signal Breakdown", "") or ""
+        if "v3_chandelier" in sb: return "v3_chandelier"
+        if "v3_fixed" in sb: return "v3_fixed"
+        if "v3" in sb: return "v3"
+        if "v10" in sb: return "v10"
+        return "unknown"
+
+    source_counts = {"v3": 0, "v10": 0, "v3_fixed": 0, "v3_chandelier": 0, "unknown": 0}
+    for e in exits:
+        src = detect_source(e)
+        source_counts[src] = source_counts.get(src, 0) + 1
+
     live_payload = clean_for_json({
-        "total_pnl": round(total_pnl, 2),
+        "total_pnl": round(net_pnl, 2),
+        "gross_pnl": round(total_pnl, 2),
+        "total_fees": round(total_fees, 4),
         "win_rate": round(win_rate, 1),
         "open_trades": open_trades,
         "fills_count": len(fills),
@@ -133,6 +146,10 @@ with tab_live:
         "sample_size": sample_size,
         "sample_pct": round(sample_pct, 1),
         "signal_fires": signal_fires,
+        "v3_count": source_counts.get("v3", 0),
+        "v10_count": source_counts.get("v10", 0),
+        "v3f_count": source_counts.get("v3_fixed", 0),
+        "v3ch_count": source_counts.get("v3_chandelier", 0),
     })
 
     LIVE_HTML = f"""<!DOCTYPE html>
@@ -151,6 +168,7 @@ body {{ background: radial-gradient(ellipse 90% 12% at 50% 0%, rgba(255,255,255,
 .gadget::before {{ content:''; position:absolute; top:0; left:0; right:0; height:48%; background:linear-gradient(180deg,rgba(255,255,255,0.88) 0%,rgba(255,255,255,0.35) 60%,rgba(255,255,255,0) 100%); border-radius:10px 10px 50% 50%; pointer-events:none; }}
 .gadget-label {{ position:relative; z-index:1; font-size:9.5px; font-weight:600; text-transform:uppercase; letter-spacing:1.4px; color:#1a6a8a; margin-bottom:4px; }}
 .gadget-value {{ position:relative; z-index:1; font-family:Georgia,serif; font-weight:700; font-size:26px; color:#063e5a; line-height:1; }}
+.gadget-sub {{ position:relative; z-index:1; font-size:10px; color:#1a6a8a; margin-top:4px; }}
 .section {{ font-size:11.5px; font-weight:600; text-transform:uppercase; letter-spacing:1.3px; color:#063a52; padding-bottom:5px; margin:16px 0 10px 0; border-bottom:1px solid rgba(255,255,255,0.9); }}
 .chart-panel {{ background:linear-gradient(180deg,rgba(255,255,255,0.75) 0%,rgba(220,245,255,0.55) 100%); border:1px solid rgba(255,255,255,0.95); border-radius:10px; padding:12px; box-shadow:inset 0 1px 0 rgba(255,255,255,1),0 4px 10px rgba(0,80,120,0.15); margin-bottom:12px; }}
 .chart-svg {{ width:100%; height:160px; display:block; }}
@@ -168,14 +186,22 @@ body {{ background: radial-gradient(ellipse 90% 12% at 50% 0%, rgba(255,255,255,
   <div class="window-titlebar"><span>🐋 Whale Bot Dashboard</span><span>Refreshed {live_payload["refreshed"]}</span></div>
   <div class="window-body">
     <div class="gadget-row">
-      <div class="gadget"><div class="gadget-label">Total P/L</div><div class="gadget-value">${live_payload["total_pnl"]:,.2f}</div></div>
+      <div class="gadget"><div class="gadget-label">Net P/L</div><div class="gadget-value">${live_payload["total_pnl"]:,.2f}</div><div class="gadget-sub">fees ${live_payload["total_fees"]:.4f}</div></div>
       <div class="gadget"><div class="gadget-label">Win Rate</div><div class="gadget-value">{live_payload["win_rate"]:.0f}%</div></div>
       <div class="gadget"><div class="gadget-label">Open</div><div class="gadget-value">{live_payload["open_trades"]}</div></div>
       <div class="gadget"><div class="gadget-label">Fills</div><div class="gadget-value">{live_payload["fills_count"]}</div></div>
     </div>
     <div class="section">📈 Sample Size Progress</div>
-    <div class="chart-panel"><div class="progress-wrap"><div class="progress-fill" style="width:{live_payload["sample_pct"]}%"></div><div class="progress-label">{live_payload["sample_size"]} / 90 trades</div></div></div>
-    <div class="section">💹 Equity Curve</div><div class="chart-panel" id="equity-panel"></div>
+    <div class="chart-panel">
+      <div class="progress-wrap"><div class="progress-fill" style="width:{live_payload["sample_pct"]}%"></div><div class="progress-label">{live_payload["sample_size"]} / 90 trades</div></div>
+      <div style="display:flex;justify-content:space-between;margin-top:10px;font-size:10.5px;color:#1a6a8a;">
+        <span>v3: {live_payload["v3_count"]}</span>
+        <span>v10: {live_payload["v10_count"]}</span>
+        <span>v3_fixed: {live_payload["v3f_count"]}</span>
+        <span>v3_chandelier: {live_payload["v3ch_count"]}</span>
+      </div>
+    </div>
+    <div class="section">💹 Equity Curve (net)</div><div class="chart-panel" id="equity-panel"></div>
     <div class="section">📋 Recent Trades</div><div id="trades-panel"></div>
     <div class="section">📕 Recent Exits</div><div id="exits-panel"></div>
   </div>
@@ -207,10 +233,10 @@ function renderTable(id, rows, fields, headers, emptyMsg) {{
     html += '</tbody></table>'; panel.innerHTML = html;
 }}
 renderTable('trades-panel', DATA.trades, ['Timestamp','Symbol','Qty','Price','Score','Threshold'], ['Time','Symbol','Qty','Price','Score','Thr'], '🌊 No trades yet.');
-renderTable('exits-panel', DATA.exits, ['Exit Timestamp','Symbol','Exit Reason','PnL Dollars','Source'], ['Time','Symbol','Reason','P/L $','Source'], '🌊 No exits yet.');
+renderTable('exits-panel', DATA.exits, ['Exit Timestamp','Symbol','Exit Reason','PnL Dollars','Source','Fees'], ['Time','Symbol','Reason','P/L $','Source','Fees'], '🌊 No exits yet.');
 </script>
 </body></html>"""
-    components.html(LIVE_HTML, height=1600, scrolling=True)
+    components.html(LIVE_HTML, height=1700, scrolling=True)
 
 
 # ============================================================
@@ -227,7 +253,6 @@ with tab_research:
         st.error(f"Research fetch failed: {e}")
         astro_rows, reflexive_rows, mab_rows, signals_rows, exits_for_viz = [], [], [], [], []
 
-    # --- LLM NARRATIVE ---
     current_astro = {}
     if astro_rows:
         nyse = sorted([a for a in astro_rows if a.get('Reference') == 'NYSE'], key=lambda x: x.get('Timestamp',''))
@@ -243,7 +268,6 @@ with tab_research:
         for r in sorted(mab_rows, key=lambda x: x.get('Timestamp','')):
             mab_latest[r.get('Signal')] = float(r.get('Weight', 0))
 
-    # Import visualizer
     try:
         from visualizer import narrate_state, build_state_space_figure, build_signal_heatmap
         narrative = narrate_state(current_astro, current_reflexive, mab_latest, exits_for_viz)
@@ -254,7 +278,6 @@ with tab_research:
         fig_state = None
         fig_heatmap = None
 
-    # --- CUSTOM CSS ---
     RESEARCH_CSS = """
     <style>
     .research-header {
@@ -292,13 +315,11 @@ with tab_research:
 
     st.markdown('<div class="research-header">✨ Astrological Research Lab ✨</div>', unsafe_allow_html=True)
 
-    # --- LLM NARRATIVE BOX ---
     st.markdown(
         f'<div class="narrative-box"><h3>🧠 AI Interpretation</h3>{narrative}</div>',
         unsafe_allow_html=True
     )
 
-    # --- ANIMATED VISUALIZER ---
     if fig_state:
         st.markdown("### 🌌 State Space Animation")
         st.plotly_chart(fig_state, use_container_width=True)
@@ -309,7 +330,6 @@ with tab_research:
         st.markdown("### 🔥 Signal Fire Heatmap")
         st.plotly_chart(fig_heatmap, use_container_width=True)
 
-    # --- ASTRO / REFLEXIVE / MAB (existing panels) ---
     astro_display = float(current_astro.get('Astro_Score', 0))
     astro_pct = max(0, min(100, (astro_display + 10) * 5))
 
