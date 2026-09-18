@@ -1,6 +1,7 @@
 """
 Shared utilities for all Whale Bots.
-Centralized API calls, Airtable-backed drawdown, failure tracking.
+Centralized API calls, Airtable-backed drawdown, failure tracking,
+GLOBAL exposure cap.
 """
 
 import os, time, json, random, logging, requests
@@ -16,6 +17,9 @@ AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
 AIRTABLE_RUNS_TABLE_ID = os.environ.get("AIRTABLE_RUNS_TABLE_ID")
 AIRTABLE_PEAK_TABLE_ID = os.environ.get("AIRTABLE_PEAK_TABLE_ID")
 
+# Global cap on total exposure across ALL bots (default 30% of equity)
+GLOBAL_EXPOSURE_CAP_PCT = float(os.environ.get("GLOBAL_EXPOSURE_CAP_PCT", "0.30"))
+
 # ============================================================
 # LOGGER
 # ============================================================
@@ -29,10 +33,9 @@ def get_logger(name, logfile):
     return log
 
 # ============================================================
-# SAFE REQUEST — every external call goes through here
+# SAFE REQUEST
 # ============================================================
 def safe_request(fn, *args, max_retries=3, **kwargs):
-    """Exponential backoff wrapper. Retries on 429/5xx and network errors."""
     for i in range(max_retries):
         try:
             r = fn(*args, **kwargs)
@@ -67,11 +70,10 @@ def send_telegram(msg):
         pass
 
 # ============================================================
-# AIRTABLE — Runs table logging
+# AIRTABLE — Runs
 # ============================================================
 def log_run(bot_name, status, equity=None, positions=0, threshold=None,
             top_candidate=None, top_score=None, action="", error=""):
-    """Write one row to the Runs table. Never raises."""
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_RUNS_TABLE_ID]):
             return
@@ -93,51 +95,60 @@ def log_run(bot_name, status, equity=None, positions=0, threshold=None,
         pass
 
 # ============================================================
-# AIRTABLE — Peak equity (persistent across runs)
+# AIRTABLE — Peak
 # ============================================================
+def _find_numeric_field(fields, preferred=("Value", "value", "Peak", "peak", "Equity", "equity")):
+    for k in preferred:
+        if k in fields:
+            try:
+                return k, float(fields[k])
+            except (ValueError, TypeError):
+                continue
+    for k, v in fields.items():
+        if isinstance(v, (int, float)):
+            return k, float(v)
+    return None, None
+
 def get_peak_equity():
-    """Read peak equity from Airtable. Returns None if not set."""
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_PEAK_TABLE_ID]):
             return None
         from pyairtable import Api
         table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_PEAK_TABLE_ID)
-        rows = table.all(formula="{Key}='peak_equity'")
-        if not rows:
-            return None
-        return float(rows[0]['fields'].get('Value', 0))
+        rows = table.all()
+        if not rows: return None
+        _, val = _find_numeric_field(rows[0]['fields'])
+        return val
     except Exception:
         return None
 
 def set_peak_equity(value):
-    """Update peak equity in Airtable."""
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_PEAK_TABLE_ID]):
             return
         from pyairtable import Api
         table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_PEAK_TABLE_ID)
-        rows = table.all(formula="{Key}='peak_equity'")
+        rows = table.all()
         if rows:
-            table.update(rows[0]['id'], {"Value": round(float(value), 4)})
+            field_name, _ = _find_numeric_field(rows[0]['fields'])
+            if not field_name:
+                field_name = "Value"
+            table.update(rows[0]['id'], {field_name: round(float(value), 4)})
         else:
-            table.create({"Key": "peak_equity", "Value": round(float(value), 4)})
+            table.create({"Value": round(float(value), 4)})
     except Exception:
         pass
 
 # ============================================================
-# AIRTABLE — Failure check (auto-halt after N consecutive errors)
+# FAILURE CHECK
 # ============================================================
 def consecutive_failures(bot_name, lookback=3):
-    """Return number of consecutive 'error' statuses for this bot, most recent first."""
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_RUNS_TABLE_ID]):
             return 0
         from pyairtable import Api
         table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_RUNS_TABLE_ID)
-        rows = table.all(
-            formula=f"{{Bot}}='{bot_name}'",
-            sort=["-Timestamp"]
-        )[:lookback]
+        rows = table.all(formula=f"{{Bot}}='{bot_name}'", sort=["-Timestamp"])[:lookback]
         count = 0
         for r in rows:
             if r['fields'].get('Status') == 'error':
@@ -149,10 +160,9 @@ def consecutive_failures(bot_name, lookback=3):
         return 0
 
 def should_halt(bot_name):
-    """If last N runs all errored, halt this bot."""
     n = consecutive_failures(bot_name, lookback=3)
     if n >= 3:
-        send_telegram(f"🛑 *{bot_name} HALTED* — {n} consecutive errors. Check Airtable Runs.")
+        send_telegram(f"🛑 *{bot_name} HALTED* — {n} consecutive errors.")
         return True
     return False
 
@@ -173,7 +183,6 @@ def is_market_bullish():
     return bool(spy['Close'].iloc[-1] > spy['SMA200'].iloc[-1])
 
 def drawdown_check(client, threshold=0.05, log_fn=None):
-    """Return True if we should halt (drawdown too big). Uses Airtable peak."""
     try:
         a = client.get_account()
         equity = float(a.equity)
@@ -216,7 +225,6 @@ def spy_strength_pct():
         return 0.0
 
 def get_rsi_sma(symbol):
-    """Returns (rsi, close, sma50) or (None, None, None)."""
     try:
         df = yf.Ticker(symbol).history(period="3mo", interval="1d", auto_adjust=True)
         if df.empty or len(df) < 50:
@@ -232,7 +240,6 @@ def get_rsi_sma(symbol):
         return None, None, None
 
 def get_peak_since(symbol, since_time):
-    """Highest intraday high since since_time (uses 5m bars, last 5 days)."""
     try:
         df = yf.Ticker(symbol).history(period="5d", interval="5m", auto_adjust=True)
         if df.empty:
@@ -251,7 +258,6 @@ def run_is_dry():
     return os.environ.get("DRY_RUN", "0") == "1"
 
 def clean_for_json(obj):
-    """Recursively replace NaN/Inf with 0. Used by dashboard."""
     import math
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
@@ -264,29 +270,52 @@ def clean_for_json(obj):
     return obj
 
 # ============================================================
+# GLOBAL EXPOSURE CAP (new)
+# ============================================================
+def total_exposure(client):
+    """Sum of all filled position market values."""
+    try:
+        positions = client.get_all_positions()
+        return sum(float(p.market_value) for p in positions)
+    except Exception:
+        return 0.0
+
+def would_exceed_global_cap(client, new_position_value, log_fn=None):
+    """
+    Check if adding a new position would breach the global exposure cap.
+    Returns (ok_to_trade, current_exposure, cap, equity).
+    Fails open (returns True) if check errors out — we don't want to block
+    trades on a flaky API call.
+    """
+    try:
+        a = client.get_account()
+        equity = float(a.equity)
+        exposure = total_exposure(client)
+        cap = equity * GLOBAL_EXPOSURE_CAP_PCT
+        new_total = exposure + float(new_position_value)
+        ok = new_total <= cap
+        if log_fn:
+            log_fn(f"  🌐 global cap: ${exposure:.2f} + ${new_position_value:.2f} = "
+                   f"${new_total:.2f} / ${cap:.2f} ({GLOBAL_EXPOSURE_CAP_PCT:.0%}) "
+                   f"→ {'OK' if ok else 'BLOCKED'}")
+        return ok, exposure, cap, equity
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠️ global cap check failed: {e}")
+        return True, 0.0, 0.0, 0.0
+
+# ============================================================
 # PURE FUNCTIONS (unit-testable)
 # ============================================================
 def score_mult(score, threshold):
-    """Position size multiplier based on gap over threshold."""
     gap = score - threshold
-    if gap <= 0:
-        return 0.5
-    if gap <= 1:
-        return 0.75
-    if gap <= 2:
-        return 1.0
-    if gap <= 3:
-        return 1.25
+    if gap <= 0: return 0.5
+    if gap <= 1: return 0.75
+    if gap <= 2: return 1.0
+    if gap <= 3: return 1.25
     return 1.5
 
 def calc_dynamic_threshold_base(regime_strength, vix, num_positions):
-    """
-    Pure version of the dynamic threshold logic.
-    Returns (threshold, reason_list).
-    regime_strength: percent above/below 200MA
-    vix: current VIX level
-    num_positions: currently held
-    """
     t = 4.0
     reasons = []
     if regime_strength < 0:
@@ -306,10 +335,6 @@ def calc_dynamic_threshold_base(regime_strength, vix, num_positions):
     return max(3.0, min(t, 15.0)), reasons
 
 def atr_multiplier_from_series(high, low, close, lookback=20):
-    """
-    Pure ATR multiplier. Inputs are pandas Series.
-    Returns multiplier in [0.5, 1.5].
-    """
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
