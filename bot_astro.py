@@ -1,6 +1,6 @@
 """
 Whale Bot Astro - Self-hosted Swiss Ephemeris calculations.
-No API key. No 404s. Runs offline.
+Vedaksha optional. Local nakshatra fallback. Runs 24/7.
 """
 
 import os, json, math, logging
@@ -27,33 +27,25 @@ log = get_logger("astro", "astro_bot.log")
 def L(m): print(m); log.info(m)
 
 # ============================================================
-# PLANET IDS (Swiss Ephemeris)
+# PLANET IDS
 # ============================================================
 PLANETS = {
-    "sun": swe.SUN,
-    "moon": swe.MOON,
-    "mercury": swe.MERCURY,
-    "venus": swe.VENUS,
-    "mars": swe.MARS,
-    "jupiter": swe.JUPITER,
-    "saturn": swe.SATURN,
-    "uranus": swe.URANUS,
-    "neptune": swe.NEPTUNE,
-    "pluto": swe.PLUTO,
-    "rahu": swe.MEAN_NODE,  # North Node = Rahu in Vedic
+    "sun": swe.SUN, "moon": swe.MOON, "mercury": swe.MERCURY,
+    "venus": swe.VENUS, "mars": swe.MARS, "jupiter": swe.JUPITER,
+    "saturn": swe.SATURN, "uranus": swe.URANUS,
+    "neptune": swe.NEPTUNE, "pluto": swe.PLUTO,
+    "rahu": swe.MEAN_NODE,
 }
 
-SIGNS = [
-    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
-    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
-]
+SIGNS = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo",
+         "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
 
 NAKSHATRAS = [
-    "Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
-    "Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni", "Uttara Phalguni",
-    "Hasta", "Chitra", "Swati", "Vishakha", "Anuradha", "Jyeshtha",
-    "Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana", "Dhanishta", "Shatabhisha",
-    "Purva Bhadrapada", "Uttara Bhadrapada", "Revati"
+    "Ashwini","Bharani","Krittika","Rohini","Mrigashira","Ardra",
+    "Punarvasu","Pushya","Ashlesha","Magha","Purva Phalguni","Uttara Phalguni",
+    "Hasta","Chitra","Swati","Vishakha","Anuradha","Jyeshtha",
+    "Mula","Purva Ashadha","Uttara Ashadha","Shravana","Dhanishta","Shatabhisha",
+    "Purva Bhadrapada","Uttara Bhadrapada","Revati"
 ]
 
 def sign_of(lon):
@@ -63,21 +55,14 @@ def degree_in_sign(lon):
     return round(lon % 30, 2)
 
 def nakshatra_of(lon):
-    # 27 nakshatras, each 13°20'
+    """Local nakshatra calculation. No Vedaksha needed."""
     idx = int(lon // (360 / 27)) % 27
     return NAKSHATRAS[idx]
 
-# ============================================================
-# JULIAN DAY
-# ============================================================
 def to_julian(dt):
     return swe.julday(dt.year, dt.month, dt.day, dt.hour + dt.minute / 60.0)
 
-# ============================================================
-# FETCH PLANET POSITIONS
-# ============================================================
 def get_positions(jd, sidereal=False):
-    """Return dict of planet -> {lon, sign, degree, retrograde}."""
     flags = swe.FLG_SWIEPH | swe.FLG_SPEED
     if sidereal:
         swe.set_sid_mode(swe.SIDM_LAHIRI)
@@ -88,7 +73,7 @@ def get_positions(jd, sidereal=False):
         try:
             pos, _ = swe.calc_ut(jd, pid, flags)
             lon = pos[0]
-            speed = pos[3]  # degrees/day; negative = retrograde
+            speed = pos[3]
             out[name] = {
                 "lon": round(lon, 4),
                 "sign": sign_of(lon),
@@ -99,9 +84,6 @@ def get_positions(jd, sidereal=False):
             L(f"⚠️ {name} calc failed: {e}")
     return out
 
-# ============================================================
-# MOON PHASE
-# ============================================================
 def get_moon_phase(jd):
     try:
         sun_pos, _ = swe.calc_ut(jd, swe.SUN, swe.FLG_SWIEPH)
@@ -117,24 +99,17 @@ def get_moon_phase(jd):
         elif elongation < 315: phase = "Last Quarter"
         else: phase = "Waning Crescent"
 
-        # Illumination: 0.5 * (1 - cos(elongation))
         illum = round(50 * (1 - math.cos(math.radians(elongation))), 2)
         return {"phase": phase, "illumination": illum, "elongation": round(elongation, 2)}
     except Exception as e:
         L(f"⚠️ Moon phase error: {e}")
         return {"phase": "Unknown", "illumination": 0, "elongation": 0}
 
-# ============================================================
-# ASPECTS (between planets)
-# ============================================================
 ASPECT_ANGLES = {
-    "Conjunction": 0,
-    "Sextile": 60,
-    "Square": 90,
-    "Trine": 120,
-    "Opposition": 180,
+    "Conjunction": 0, "Sextile": 60, "Square": 90,
+    "Trine": 120, "Opposition": 180,
 }
-ORB = 6.0  # degrees of tolerance
+ORB = 6.0
 
 def compute_aspects(positions):
     out = []
@@ -143,22 +118,16 @@ def compute_aspects(positions):
         for j in range(i+1, len(keys)):
             p1, p2 = keys[i], keys[j]
             d = abs((positions[p1]["lon"] - positions[p2]["lon"]) % 360)
-            if d > 180:
-                d = 360 - d
+            if d > 180: d = 360 - d
             for asp_name, asp_angle in ASPECT_ANGLES.items():
                 if abs(d - asp_angle) <= ORB:
                     out.append({
-                        "planet1": p1,
-                        "planet2": p2,
-                        "aspect": asp_name,
-                        "exact_angle": round(d, 2),
+                        "planet1": p1, "planet2": p2,
+                        "aspect": asp_name, "exact_angle": round(d, 2),
                     })
                     break
     return out
 
-# ============================================================
-# SCORING
-# ============================================================
 TIER_1 = ["saturn", "jupiter", "moon"]
 TIER_2 = ["mars", "venus", "mercury"]
 TIER_3 = ["sun", "uranus", "neptune", "pluto"]
@@ -184,23 +153,15 @@ def compute_astro_score(positions, aspects, moon_phase):
     breakdown = {}
 
     illum = moon_phase.get("illumination", 0)
-    if illum > 50:
-        score += 1.5
-        breakdown["moon_full"] = 1.5
-    elif illum < 10:
-        score -= 1.0
-        breakdown["moon_new"] = -1.0
+    if illum > 50: score += 1.5; breakdown["moon_full"] = 1.5
+    elif illum < 10: score -= 1.0; breakdown["moon_new"] = -1.0
 
     for asp in aspects:
-        p1, p2 = asp["planet1"], asp["planet2"]
-        atype = asp["aspect"]
+        p1, p2, atype = asp["planet1"], asp["planet2"], asp["aspect"]
         contribution = (planet_weight(p1) + planet_weight(p2)) * aspect_score(atype) * 0.5
-        if atype.lower() in ("trine", "sextile"):
-            score += contribution
-        elif atype.lower() in ("square", "opposition"):
-            score -= contribution
-        else:
-            score += contribution * 0.3
+        if atype.lower() in ("trine", "sextile"): score += contribution
+        elif atype.lower() in ("square", "opposition"): score -= contribution
+        else: score += contribution * 0.3
         breakdown[f"{p1}_{p2}_{atype}"] = round(contribution, 2)
 
     for planet in ["mercury", "venus", "mars", "jupiter", "saturn"]:
@@ -209,13 +170,25 @@ def compute_astro_score(positions, aspects, moon_phase):
             score += penalty
             breakdown[f"{planet}_retrograde"] = penalty
 
-    score = max(-10, min(10, score))
-    return round(score, 2), breakdown
+    return round(max(-10, min(10, score)), 2), breakdown
 
-# ============================================================
-# AIRTABLE LOGGING
-# ============================================================
-def log_astro(reference, positions, moon_phase, score, breakdown):
+def get_vedaksha_data(dt_utc, lat, lon, moon_lon=0):
+    """Try Vedaksha first. Fall back to local nakshatra calc."""
+    try:
+        import vedaksha
+        chart = vedaksha.chart(dt_utc.strftime("%Y-%m-%d %H:%M:%S"), lat, lon)
+        return {
+            "nakshatra": chart.get("moon_nakshatra", nakshatra_of(moon_lon)),
+            "dasha": chart.get("current_dasha", ""),
+            "houses": chart.get("houses", {}),
+        }
+    except ImportError:
+        return {"nakshatra": nakshatra_of(moon_lon), "dasha": "", "houses": {}}
+    except Exception as e:
+        L(f"⚠️ Vedaksha error: {e}")
+        return {"nakshatra": nakshatra_of(moon_lon), "dasha": "", "houses": {}}
+
+def log_astro(reference, positions, moon_phase, score, breakdown, vedic):
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_ASTRO_TABLE_ID]):
             return
@@ -229,6 +202,8 @@ def log_astro(reference, positions, moon_phase, score, breakdown):
         ven = positions.get("venus", {})
         mars = positions.get("mars", {})
         rahu = positions.get("rahu", {})
+
+        houses = vedic.get("houses", {})
 
         payload = {
             "Timestamp": datetime.now().isoformat(),
@@ -245,23 +220,21 @@ def log_astro(reference, positions, moon_phase, score, breakdown):
             "Jupiter_Degree": jup.get("degree", 0),
             "Saturn_Sign": sat.get("sign", ""),
             "Saturn_Degree": sat.get("degree", 0),
-            "Nakshatra": nakshatra_of(moon.get("lon", 0)),
-            "Current_Dasha": "",
+            "Nakshatra": vedic.get("nakshatra", nakshatra_of(moon.get("lon", 0))),
+            "Current_Dasha": vedic.get("dasha", ""),
             "Astro_Score": score,
             "Astro_Hierarchy": json.dumps(breakdown),
-            "Vedic_House_2": rahu.get("sign", ""),
-            "Vedic_House_5": "",
-            "Vedic_House_8": "",
-            "Vedic_House_11": "",
+            "Vedic_House_2": str(houses.get("2", rahu.get("sign", ""))),
+            "Vedic_House_5": str(houses.get("5", "")),
+            "Vedic_House_8": str(houses.get("8", "")),
+            "Vedic_House_11": str(houses.get("11", "")),
         }
+        payload = clean_for_json(payload)
         table.create(payload)
-        L(f"✅ Astro logged [{reference}]: score={score}")
+        L(f"✅ Astro logged [{reference}]: score={score} nakshatra={vedic.get('nakshatra','')}")
     except Exception as e:
         L(f"⚠️ Astro log failed: {e}")
 
-# ============================================================
-# MAIN
-# ============================================================
 def run():
     L("=" * 60)
     L(f"astro start {datetime.now().isoformat()}")
@@ -281,8 +254,9 @@ def run():
         L(f"  Mercury Rx: {positions.get('mercury',{}).get('retrograde', False)}")
         L(f"  Aspects: {len(aspects)}")
 
+        vedic = get_vedaksha_data(dt, lat, lon, positions.get("moon", {}).get("lon", 0))
         score, breakdown = compute_astro_score(positions, aspects, moon_phase)
-        log_astro(ref, positions, moon_phase, score, breakdown)
+        log_astro(ref, positions, moon_phase, score, breakdown, vedic)
 
     log_run("astro", "ok", action="astro signals logged")
     L("=" * 60)
