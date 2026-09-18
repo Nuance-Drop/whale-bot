@@ -1,7 +1,6 @@
 """
 Whale Bot v10 - Full 8-signal trading with adaptive Thompson Sampling weights.
-Trades NVDA, GOOGL, META, AMZN. Max 2 positions, 10% tactical cap.
-Global exposure cap enforced at 30% of equity.
+Global exposure cap + correlation check enforced.
 """
 
 import os, csv, time, json, logging, traceback
@@ -22,7 +21,7 @@ from common import (
     get_logger, safe_request, send_telegram, log_run, is_market_open,
     is_market_bullish, drawdown_check, get_vix, spy_strength_pct,
     get_rsi_sma, run_is_dry, should_halt, http_get, http_post,
-    would_exceed_global_cap
+    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees
 )
 
 try:
@@ -56,7 +55,6 @@ WEIGHTS_FILE = "signal_weights.json"
 
 log = get_logger("v10", "bot.log")
 def L(m): print(m); log.info(m)
-def phase(n): L(f"\n===== V10: {n} =====")
 
 DEFAULT_WEIGHTS = {"regime":1.0,"rsi":1.0,"sma":1.0,"sentiment":1.0,
                    "congress":2.0,"insider":2.0,"pead":1.0,"flow":2.0}
@@ -224,6 +222,7 @@ def log_exit(sym, entry, exit_price, qty, reason, peak=None, sigs=None, pnl_pct=
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
         pnl_d = (exit_price - entry) * qty
         pnl_p = (exit_price - entry) / entry * 100 if entry else 0
+        fees = estimate_regulatory_fees(exit_price, qty)
         payload = {
             "Exit Timestamp": datetime.now().isoformat(), "Symbol": sym,
             "Entry Price": round(entry, 2), "Exit Price": round(exit_price, 2),
@@ -231,11 +230,12 @@ def log_exit(sym, entry, exit_price, qty, reason, peak=None, sigs=None, pnl_pct=
             "PnL Dollars": round(pnl_d, 2), "PnL Percent": round(pnl_p, 2),
             "Signals That Fired": json.dumps(sigs) if sigs else "",
             "Signal Score": 0, "Signal Threshold": 0,
-            "Source": "v10"
+            "Source": "v10",
+            "Fees": fees
         }
         if peak: payload["Peak Price"] = round(peak, 4)
         Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID).create(payload)
-        L(f"📕 exit {sym}: ${pnl_d:.2f}")
+        L(f"📕 exit {sym}: ${pnl_d:.2f} (fees ${fees:.4f})")
         send_telegram(f"📕 *v10 exit*: {sym} | ${pnl_d:.2f}")
         if sigs:
             try:
@@ -405,6 +405,14 @@ def run():
             L(f"⛔ global exposure cap — skipping {s}")
             log_run("v10", "skipped", equity=eq, positions=len(held), threshold=th,
                     error=f"global cap: ${exposure:.2f} + ${new_position_value:.2f} > ${gcap:.2f}")
+            return
+
+        existing_syms = [p.symbol for p in pos if p.symbol != s]
+        corr_ok, worst_corr, corr_sym = positions_correlation_risk(s, existing_syms, threshold=0.7, log_fn=L)
+        if not corr_ok:
+            L(f"⛔ correlated with {corr_sym} ({worst_corr:+.2f}) — skipping {s}")
+            log_run("v10", "skipped", equity=eq, positions=len(held), threshold=th,
+                    error=f"correlated with {corr_sym} ({worst_corr:+.2f})")
             return
 
         place_bracket(s, qty, price, sc, th, sig, mult)
