@@ -1,6 +1,6 @@
 """
 Whale Bot V3 - Backtested strategy. Trades SPY, QQQ, AAPL, MSFT. Trailing stops.
-Fixed: multi-stop accumulation bug. Source attribution. Auto-halt on failures.
+Multi-stop bug fixed. Global exposure cap enforced.
 """
 
 import os, time, logging
@@ -18,7 +18,7 @@ from pyairtable import Api
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
     drawdown_check, get_rsi_sma, get_peak_since, run_is_dry, should_halt,
-    http_get, http_post
+    http_get, http_post, would_exceed_global_cap
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -41,9 +41,6 @@ def phase(n): L(f"\n===== V3: {n} =====")
 
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
-# ============================================================
-# ORDER HELPERS
-# ============================================================
 def entry_info(sym):
     req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
     for o in client.get_orders(filter=req):
@@ -59,9 +56,6 @@ def all_open_stops(sym):
             stops.append(o)
     return stops
 
-# ============================================================
-# AIRTABLE LOGGING
-# ============================================================
 def log_entry(sym, qty, price, stop, score):
     try:
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]): return
@@ -110,9 +104,6 @@ def log_exits_from_broker():
             log_exit(o.symbol, ep, xp, q, peak)
     except Exception as e: L(f"⚠️ log exits: {e}")
 
-# ============================================================
-# TRAILING STOP MANAGER (FIXED)
-# ============================================================
 def update_trails():
     positions = client.get_all_positions()
     if not positions:
@@ -177,9 +168,6 @@ def update_trails():
         except Exception as e:
             L(f"  ❌ {sym}: stop placement failed: {e}")
 
-# ============================================================
-# ENTRY LOGIC
-# ============================================================
 def try_entry():
     if not is_market_bullish():
         L("regime: below 200MA")
@@ -213,6 +201,13 @@ def try_entry():
             qty = min(int(risk/rps), int(remaining/close))
             if qty < 1:
                 continue
+
+            new_position_value = qty * close
+            ok, exposure, gcap, _ = would_exceed_global_cap(client, new_position_value, L)
+            if not ok:
+                L(f"  ⛔ global cap — skipping {sym}")
+                continue
+
             L(f"🎯 V3 ENTRY {sym} qty {qty} @ ${close:.2f} stop ${stop}")
             if run_is_dry():
                 L(f"🟡 DRY would buy {sym}")
@@ -246,9 +241,6 @@ def try_entry():
     L("no V3 signals")
     return "no_signal"
 
-# ============================================================
-# MAIN
-# ============================================================
 def run():
     L("="*60); L(f"v3 start {datetime.now().isoformat()}")
     if not is_market_open():
