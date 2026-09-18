@@ -1,7 +1,7 @@
 """
 Shared utilities for all Whale Bots.
 Centralized API calls, Airtable-backed drawdown, failure tracking,
-GLOBAL exposure cap.
+GLOBAL exposure cap, regulatory fees, correlation checks.
 """
 
 import os, time, json, random, logging, requests
@@ -17,7 +17,6 @@ AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
 AIRTABLE_RUNS_TABLE_ID = os.environ.get("AIRTABLE_RUNS_TABLE_ID")
 AIRTABLE_PEAK_TABLE_ID = os.environ.get("AIRTABLE_PEAK_TABLE_ID")
 
-# Global cap on total exposure across ALL bots (default 30% of equity)
 GLOBAL_EXPOSURE_CAP_PCT = float(os.environ.get("GLOBAL_EXPOSURE_CAP_PCT", "0.30"))
 
 # ============================================================
@@ -270,10 +269,9 @@ def clean_for_json(obj):
     return obj
 
 # ============================================================
-# GLOBAL EXPOSURE CAP (new)
+# GLOBAL EXPOSURE CAP
 # ============================================================
 def total_exposure(client):
-    """Sum of all filled position market values."""
     try:
         positions = client.get_all_positions()
         return sum(float(p.market_value) for p in positions)
@@ -281,12 +279,6 @@ def total_exposure(client):
         return 0.0
 
 def would_exceed_global_cap(client, new_position_value, log_fn=None):
-    """
-    Check if adding a new position would breach the global exposure cap.
-    Returns (ok_to_trade, current_exposure, cap, equity).
-    Fails open (returns True) if check errors out — we don't want to block
-    trades on a flaky API call.
-    """
     try:
         a = client.get_account()
         equity = float(a.equity)
@@ -303,6 +295,67 @@ def would_exceed_global_cap(client, new_position_value, log_fn=None):
         if log_fn:
             log_fn(f"  ⚠️ global cap check failed: {e}")
         return True, 0.0, 0.0, 0.0
+
+# ============================================================
+# CORRELATION CHECK
+# ============================================================
+def positions_correlation_risk(candidate_symbol, existing_symbols, threshold=0.7, log_fn=None):
+    """
+    Check if candidate_symbol is highly correlated with any existing position.
+    Returns (ok_to_trade, highest_corr, correlated_with).
+    """
+    if not existing_symbols:
+        return True, 0.0, None
+    try:
+        all_syms = [candidate_symbol] + list(existing_symbols)
+        data = yf.download(all_syms, period="2mo", interval="1d",
+                           auto_adjust=True, progress=False)['Close']
+        if data.empty or candidate_symbol not in data.columns:
+            return True, 0.0, None
+        returns = data.pct_change().dropna()
+        if len(returns) < 10:
+            return True, 0.0, None
+
+        candidate_ret = returns[candidate_symbol]
+        worst = 0.0
+        worst_sym = None
+        for s in existing_symbols:
+            if s not in returns.columns:
+                continue
+            corr = candidate_ret.corr(returns[s])
+            if corr is None:
+                continue
+            corr = float(corr)
+            if abs(corr) > abs(worst):
+                worst = corr
+                worst_sym = s
+
+        ok = abs(worst) <= threshold
+        if log_fn:
+            log_fn(f"  🔗 correlation: {candidate_symbol} vs existing = {worst:+.2f} "
+                   f"(worst: {worst_sym}) → {'OK' if ok else 'BLOCKED'}")
+        return ok, worst, worst_sym
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠️ correlation check failed: {e}")
+        return True, 0.0, None
+
+# ============================================================
+# REGULATORY FEES
+# ============================================================
+def estimate_regulatory_fees(exit_price, qty):
+    """
+    Estimate US equity regulatory fees on a SELL order.
+    - SEC fee: $27.80 per $1,000,000 of proceeds
+    - FINRA TAF: $0.000166 per share
+    - CAT fee: $0.000114 per trade
+    Returns total fees in dollars.
+    """
+    proceeds = exit_price * qty
+    sec_fee = proceeds * 0.0000278
+    finra_fee = max(qty * 0.000166, 0.01)
+    cat_fee = max(0.000114, 0.01)
+    return round(sec_fee + finra_fee + cat_fee, 4)
 
 # ============================================================
 # PURE FUNCTIONS (unit-testable)
