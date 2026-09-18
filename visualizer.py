@@ -1,7 +1,6 @@
 """
 Animated visualizer + LLM narrator for the Whale Bot Research Lab.
-Plots each trading day as a point in (astro_score, reflexive_intensity) space.
-Colored by outcome. Animated by date. Narrated by Claude.
+Handles missing/misnamed timestamp columns gracefully.
 """
 
 import os, json, logging
@@ -16,14 +15,42 @@ log = get_logger("visualizer", "visualizer.log")
 def L(m): print(m); log.info(m)
 
 # ============================================================
+# DATE EXTRACTION — resilient to any column name
+# ============================================================
+def _extract_dates(df, preferred=("Timestamp", "timestamp", "Created", "created",
+                                   "Date", "date", "Time", "time")):
+    """Return a pandas Series of dates, or None if no date-like column found."""
+    if df.empty:
+        return None
+    # Try preferred names first
+    for col in preferred:
+        if col in df.columns:
+            try:
+                parsed = pd.to_datetime(df[col], errors='coerce')
+                if parsed.notna().sum() > 0:
+                    return parsed.dt.date
+            except Exception:
+                continue
+    # Fallback: try every column, keep the one that parses cleanly
+    best = None
+    best_count = 0
+    for col in df.columns:
+        try:
+            parsed = pd.to_datetime(df[col], errors='coerce')
+            count = parsed.notna().sum()
+            if count > best_count:
+                best = parsed.dt.date
+                best_count = count
+        except Exception:
+            continue
+    if best is not None and best_count > 0:
+        return best
+    return None
+
+# ============================================================
 # LLM NARRATOR
 # ============================================================
 def narrate_state(astro, reflexive, mab_weights, recent_trades):
-    """
-    Send current system state to Claude (or OpenAI) for a plain-English
-    interpretation. Returns a string. Falls back to a rule-based summary
-    if no API key is set.
-    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return _rule_based_narrative(astro, reflexive, mab_weights, recent_trades)
@@ -66,9 +93,8 @@ Reply with a short interpretation that a non-expert can understand."""
         return _rule_based_narrative(astro, reflexive, mab_weights, recent_trades)
 
 def _rule_based_narrative(astro, reflexive, mab_weights, recent_trades):
-    """Fallback if no LLM API key."""
-    astro_score = float(astro.get('Astro_Score', 0))
-    intensity = float(reflexive.get('Reflexive_Intensity', 0))
+    astro_score = float(astro.get('Astro_Score', 0) or 0)
+    intensity = float(reflexive.get('Reflexive_Intensity', 0) or 0)
 
     parts = []
     if astro_score > 3: parts.append("Astrological conditions are bullish.")
@@ -89,48 +115,81 @@ def _rule_based_narrative(astro, reflexive, mab_weights, recent_trades):
     return " ".join(parts)
 
 # ============================================================
-# ANIMATED STATE-SPACE SCATTER
+# STATE SPACE ANIMATION
 # ============================================================
 def build_state_space_figure(astro_rows, reflexive_rows, exits_rows):
     """
     Plot each trading day as a point.
-    X = astro score, Y = reflexive intensity, color = outcome, size = trade size.
-    Animated by date.
+    X = astro score, Y = reflexive intensity, color = outcome.
     """
     if not astro_rows:
+        L("state space: no astro rows")
         return None
 
     astro_df = pd.DataFrame(astro_rows)
-    astro_df['date'] = pd.to_datetime(astro_df['Timestamp']).dt.date
+    if astro_df.empty:
+        return None
 
-    # Deduplicate: one row per day (keep NYSE reference)
+    # Extract dates
+    dates = _extract_dates(astro_df)
+    if dates is None:
+        L("state space: no valid date column found in astro rows")
+        return None
+    astro_df['date'] = dates
+    astro_df = astro_df.dropna(subset=['date'])
+
+    # Filter to one reference (NYSE) and dedupe by date
     if 'Reference' in astro_df.columns:
-        astro_df = astro_df[astro_df['Reference'] == 'NYSE']
+        nyse_only = astro_df[astro_df['Reference'] == 'NYSE']
+        if not nyse_only.empty:
+            astro_df = nyse_only
     astro_df = astro_df.sort_values('date').drop_duplicates('date', keep='last')
 
-    # Reflexive merge
+    if astro_df.empty:
+        return None
+
+    # Ensure Astro_Score column exists
+    if 'Astro_Score' not in astro_df.columns:
+        L("state space: no Astro_Score column")
+        return None
+
+    # Merge reflexive
+    merged = astro_df[['date', 'Astro_Score']].copy()
     if reflexive_rows:
         ref_df = pd.DataFrame(reflexive_rows)
-        ref_df['date'] = pd.to_datetime(ref_df['Timestamp']).dt.date
-        ref_df = ref_df.sort_values('date').drop_duplicates('date', keep='last')
-        merged = astro_df.merge(
-            ref_df[['date', 'Reflexive_Intensity', 'VIX_Spot']],
-            on='date', how='left'
-        )
-    else:
-        merged = astro_df.copy()
+        if not ref_df.empty:
+            ref_dates = _extract_dates(ref_df)
+            if ref_dates is not None:
+                ref_df['date'] = ref_dates
+                ref_df = ref_df.dropna(subset=['date'])
+                if 'Reflexive_Intensity' in ref_df.columns:
+                    ref_df = ref_df.sort_values('date').drop_duplicates('date', keep='last')
+                    merged = merged.merge(
+                        ref_df[['date', 'Reflexive_Intensity']],
+                        on='date', how='left'
+                    )
+    if 'Reflexive_Intensity' not in merged.columns:
         merged['Reflexive_Intensity'] = 0
-        merged['VIX_Spot'] = 0
+    merged['Reflexive_Intensity'] = merged['Reflexive_Intensity'].fillna(0)
 
-    # Outcome merge
+    # Merge exits outcome
+    merged['pnl'] = 0.0
     if exits_rows:
         exits_df = pd.DataFrame(exits_rows)
-        exits_df['date'] = pd.to_datetime(exits_df['Exit Timestamp']).dt.date
-        outcome = exits_df.groupby('date')['PnL Dollars'].sum().reset_index()
-        outcome.columns = ['date', 'pnl']
-        merged = merged.merge(outcome, on='date', how='left')
-    else:
-        merged['pnl'] = 0
+        if not exits_df.empty:
+            exit_dates = _extract_dates(exits_df, preferred=("Exit Timestamp", "Timestamp"))
+            if exit_dates is not None:
+                exits_df['date'] = exit_dates
+                exits_df = exits_df.dropna(subset=['date'])
+                if 'PnL Dollars' in exits_df.columns:
+                    outcome = exits_df.groupby('date')['PnL Dollars'].sum().reset_index()
+                    outcome.columns = ['date', 'pnl']
+                    merged = merged.merge(outcome, on='date', how='left')
+                    merged['pnl'] = merged['pnl_y'].fillna(0) if 'pnl_y' in merged.columns else merged['pnl'].fillna(0)
+                    if 'pnl_x' in merged.columns:
+                        merged = merged.drop(columns=['pnl_x'])
+                    if 'pnl_y' in merged.columns:
+                        merged = merged.rename(columns={'pnl_y': 'pnl'})
 
     merged['pnl'] = merged['pnl'].fillna(0)
     merged['Outcome'] = merged['pnl'].apply(
@@ -138,25 +197,44 @@ def build_state_space_figure(astro_rows, reflexive_rows, exits_rows):
     )
     merged['Size'] = merged['pnl'].abs().apply(lambda x: max(8, min(x / 5, 40)))
 
-    fig = px.scatter(
-        merged,
-        x='Astro_Score',
-        y='Reflexive_Intensity',
-        color='Outcome',
-        size='Size',
-        animation_frame='date',
-        animation_group='date',
-        hover_name='date',
-        hover_data=['VIX_Spot', 'Nakshatra'],
-        color_discrete_map={
-            'Win': '#22c55e',
-            'Loss': '#ef4444',
-            'No Trade': '#94a3b8',
-        },
-        range_x=[-10, 10],
-        range_y=[0, 10],
-        title='State Space: Astro Score vs Reflexive Intensity'
-    )
+    # Convert date to string for plotly animation
+    merged['date_str'] = merged['date'].astype(str)
+
+    # Sort by date
+    merged = merged.sort_values('date')
+
+    # If only a few rows, show static scatter (animation not useful)
+    use_animation = len(merged) >= 5
+
+    if use_animation:
+        fig = px.scatter(
+            merged,
+            x='Astro_Score',
+            y='Reflexive_Intensity',
+            color='Outcome',
+            size='Size',
+            animation_frame='date_str',
+            animation_group='date_str',
+            hover_name='date_str',
+            color_discrete_map={'Win': '#22c55e', 'Loss': '#ef4444', 'No Trade': '#94a3b8'},
+            range_x=[-10, 10],
+            range_y=[0, 10],
+            title='State Space: Astro Score vs Reflexive Intensity'
+        )
+    else:
+        fig = px.scatter(
+            merged,
+            x='Astro_Score',
+            y='Reflexive_Intensity',
+            color='Outcome',
+            size='Size',
+            hover_name='date_str',
+            color_discrete_map={'Win': '#22c55e', 'Loss': '#ef4444', 'No Trade': '#94a3b8'},
+            range_x=[-10, 10],
+            range_y=[0, 10],
+            title='State Space: Astro Score vs Reflexive Intensity (accumulating)'
+        )
+
     fig.update_layout(
         paper_bgcolor='rgba(20,40,80,0.1)',
         plot_bgcolor='rgba(20,40,80,0.1)',
@@ -166,19 +244,33 @@ def build_state_space_figure(astro_rows, reflexive_rows, exits_rows):
     return fig
 
 # ============================================================
-# SIGNAL FIRE HEATMAP (alt visualization)
+# SIGNAL FIRE HEATMAP
 # ============================================================
 def build_signal_heatmap(signals_rows):
-    """Binary heatmap of which signals fired each day."""
     if not signals_rows:
         return None
     df = pd.DataFrame(signals_rows)
-    if 'Timestamp' not in df.columns:
+    if df.empty:
         return None
-    df['date'] = pd.to_datetime(df['Timestamp']).dt.date
-    signal_cols = ['Regime','RSI','SMA','Sentiment','Congress','Insider','PEAD','Flow']
+
+    dates = _extract_dates(df)
+    if dates is None:
+        return None
+    df['date'] = dates
+    df = df.dropna(subset=['date'])
+
+    signal_cols = ['Regime', 'RSI', 'SMA', 'Sentiment', 'Congress', 'Insider', 'PEAD', 'Flow']
     signal_cols = [c for c in signal_cols if c in df.columns]
+    if not signal_cols:
+        return None
+
+    # Coerce checkbox values to 0/1
+    for c in signal_cols:
+        df[c] = df[c].apply(lambda x: 1 if x else 0)
+
     grouped = df.groupby('date')[signal_cols].mean()
+    if grouped.empty:
+        return None
 
     fig = px.imshow(
         grouped.T,
