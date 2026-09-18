@@ -1,6 +1,6 @@
 """
 Whale Bot v3_chandelier - V3 entries with Chandelier trailing stop.
-Global exposure cap enforced.
+Global exposure cap + correlation check enforced.
 """
 
 import os, time, logging
@@ -18,7 +18,7 @@ from pyairtable import Api
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
     drawdown_check, get_rsi_sma, get_peak_since, run_is_dry, should_halt,
-    would_exceed_global_cap
+    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -83,17 +83,19 @@ def log_exit(sym, entry, exit_price, qty, peak=None):
         if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
         pd_ = (exit_price - entry) * qty
         pp_ = (exit_price - entry) / entry * 100
+        fees = estimate_regulatory_fees(exit_price, qty)
         payload = {
             "Exit Timestamp": datetime.now().isoformat(), "Symbol": sym,
             "Entry Price": round(entry, 2), "Exit Price": round(exit_price, 2),
             "Qty": qty, "Exit Reason": "STOP_LOSS",
             "PnL Dollars": round(pd_, 2), "PnL Percent": round(pp_, 2),
             "Signals That Fired": "v3_chandelier", "Signal Score": 3, "Signal Threshold": 3,
-            "Source": "v3_chandelier"
+            "Source": "v3_chandelier",
+            "Fees": fees
         }
         if peak: payload["Peak Price"] = round(peak, 4)
         Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID).create(payload)
-        L(f"📕 v3_chandelier exit {sym}: ${pd_:.2f} peak ${peak}")
+        L(f"📕 v3_chandelier exit {sym}: ${pd_:.2f} peak ${peak} fees ${fees:.4f}")
         send_telegram(f"📕 *v3_chandelier exit*: {sym} | ${pd_:.2f}")
     except Exception as e: L(f"⚠️ exit log: {e}")
 
@@ -209,6 +211,12 @@ def try_entry():
             ok, exposure, gcap, _ = would_exceed_global_cap(client, new_position_value, L)
             if not ok:
                 L(f"  ⛔ global cap — skipping {sym}")
+                continue
+
+            existing_syms = [p.symbol for p in pos if p.symbol != sym]
+            corr_ok, worst_corr, corr_sym = positions_correlation_risk(sym, existing_syms, threshold=0.7, log_fn=L)
+            if not corr_ok:
+                L(f"  ⛔ correlated with {corr_sym} ({worst_corr:+.2f}) — skipping {sym}")
                 continue
 
             L(f"🎯 v3_chandelier ENTRY {sym} qty {qty} @ ${close:.2f} stop ${stop}")
