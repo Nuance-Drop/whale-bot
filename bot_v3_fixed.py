@@ -1,6 +1,6 @@
 """
 Whale Bot v3_fixed - V3 entries with FIXED bracket exits.
-Isolates entry quality from exit quality.
+Global exposure cap enforced.
 """
 
 import os, time, logging
@@ -16,7 +16,8 @@ from pyairtable import Api
 
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
-    drawdown_check, get_rsi_sma, run_is_dry, should_halt, http_get, http_post
+    drawdown_check, get_rsi_sma, run_is_dry, should_halt, http_get, http_post,
+    would_exceed_global_cap
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -107,6 +108,13 @@ def try_entry():
             rps = close * STOP_LOSS_PCT
             qty = min(int(risk/rps), int(remaining/close))
             if qty < 1: continue
+
+            new_position_value = qty * close
+            ok, exposure, gcap, _ = would_exceed_global_cap(client, new_position_value, L)
+            if not ok:
+                L(f"  ⛔ global cap — skipping {sym}")
+                continue
+
             L(f"🎯 v3_fixed {sym} qty {qty} @ ${close:.2f} SL ${stop} TP ${target}")
             if run_is_dry():
                 send_telegram(f"🟡 *v3_fixed DRY*: {sym} {qty} @ ${close:.2f}")
@@ -133,7 +141,7 @@ def run():
         L("market closed"); log_run("v3_fixed", "market_closed"); return
 
     if should_halt("v3_fixed"):
-        L("🛑 halted due to consecutive failures")
+        L("🛑 halted")
         log_run("v3_fixed", "error", error="halted due to consecutive failures")
         return
 
