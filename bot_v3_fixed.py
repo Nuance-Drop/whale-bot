@@ -1,6 +1,6 @@
 """
 Whale Bot v3_fixed - V3 entries with FIXED bracket exits.
-Global exposure cap enforced.
+Global exposure cap + correlation check enforced.
 """
 
 import os, time, logging
@@ -17,7 +17,7 @@ from pyairtable import Api
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
     drawdown_check, get_rsi_sma, run_is_dry, should_halt, http_get, http_post,
-    would_exceed_global_cap
+    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -68,6 +68,7 @@ def log_exits_from_broker():
             if ep is None: continue
             xp = float(o.filled_avg_price); q = int(o.filled_qty)
             pd_ = (xp - ep) * q; pp_ = (xp - ep) / ep * 100
+            fees = estimate_regulatory_fees(xp, q)
             reason = "OTHER"
             try:
                 if o.order_type.value == "stop": reason = "STOP_LOSS"
@@ -79,9 +80,10 @@ def log_exits_from_broker():
                 "Qty": q, "Exit Reason": reason,
                 "PnL Dollars": round(pd_, 2), "PnL Percent": round(pp_, 2),
                 "Signals That Fired": "v3_fixed", "Signal Score": 3, "Signal Threshold": 3,
-                "Source": "v3_fixed"
+                "Source": "v3_fixed",
+                "Fees": fees
             })
-            L(f"📕 v3_fixed exit {o.symbol}: ${pd_:.2f}")
+            L(f"📕 v3_fixed exit {o.symbol}: ${pd_:.2f} fees ${fees:.4f}")
             send_telegram(f"📕 *v3_fixed exit*: {o.symbol} | ${pd_:.2f}")
     except Exception as e: L(f"⚠️ log exits: {e}")
 
@@ -113,6 +115,12 @@ def try_entry():
             ok, exposure, gcap, _ = would_exceed_global_cap(client, new_position_value, L)
             if not ok:
                 L(f"  ⛔ global cap — skipping {sym}")
+                continue
+
+            existing_syms = [p.symbol for p in pos if p.symbol != sym]
+            corr_ok, worst_corr, corr_sym = positions_correlation_risk(sym, existing_syms, threshold=0.7, log_fn=L)
+            if not corr_ok:
+                L(f"  ⛔ correlated with {corr_sym} ({worst_corr:+.2f}) — skipping {sym}")
                 continue
 
             L(f"🎯 v3_fixed {sym} qty {qty} @ ${close:.2f} SL ${stop} TP ${target}")
