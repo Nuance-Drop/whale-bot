@@ -1,6 +1,6 @@
 """
 Whale Bot v3_chandelier - V3 entries with Chandelier trailing stop.
-Stop = highest_high - (ATR_multiple × ATR), activates only after position is up.
+Global exposure cap enforced.
 """
 
 import os, time, logging
@@ -17,7 +17,8 @@ from pyairtable import Api
 
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
-    drawdown_check, get_rsi_sma, get_peak_since, run_is_dry, should_halt
+    drawdown_check, get_rsi_sma, get_peak_since, run_is_dry, should_halt,
+    would_exceed_global_cap
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -29,8 +30,8 @@ AIRTABLE_EXITS_TABLE_ID = os.environ.get("AIRTABLE_EXITS_TABLE_ID")
 
 WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT"]
 INITIAL_STOP_PCT = 0.025
-ATR_MULT = 2.5              # Chandelier width
-ACTIVATION_MULT = 2.0        # Only activate after 2×ATR profit
+ATR_MULT = 2.5
+ACTIVATION_MULT = 2.0
 RISK_PER_TRADE = 0.02
 MAX_POSITIONS = 2
 TACTICAL_LIMIT_PCT = 0.10
@@ -115,7 +116,6 @@ def log_exits_from_broker():
     except Exception as e: L(f"⚠️ log exits: {e}")
 
 def update_chandelier_stops():
-    """Chandelier: stop = peak - ATR_MULT × ATR. Only active after profit threshold."""
     positions = client.get_all_positions()
     if not positions:
         L("No open positions.")
@@ -135,7 +135,6 @@ def update_chandelier_stops():
         profit = peak - ep
         activation_level = ACTIVATION_MULT * atr
 
-        # Only activate Chandelier after 2×ATR profit
         if profit < activation_level:
             current_stop = ep * (1 - INITIAL_STOP_PCT)
         else:
@@ -150,7 +149,6 @@ def update_chandelier_stops():
         L(f"  {sym}: entry ${ep:.2f} peak ${peak:.2f} ATR ${atr:.2f} "
           f"target ${target:.2f} existing={stop_prices}")
 
-        # Handle duplicate stops
         if len(stops) > 1:
             L(f"  🚨 {sym}: {len(stops)} stops, cancelling extras")
             for s in stops:
@@ -206,6 +204,13 @@ def try_entry():
             rps = close * INITIAL_STOP_PCT
             qty = min(int(risk/rps), int(remaining/close))
             if qty < 1: continue
+
+            new_position_value = qty * close
+            ok, exposure, gcap, _ = would_exceed_global_cap(client, new_position_value, L)
+            if not ok:
+                L(f"  ⛔ global cap — skipping {sym}")
+                continue
+
             L(f"🎯 v3_chandelier ENTRY {sym} qty {qty} @ ${close:.2f} stop ${stop}")
             if run_is_dry():
                 send_telegram(f"🟡 *v3_chandelier DRY*: {sym} {qty} @ ${close:.2f}")
