@@ -1,6 +1,6 @@
 """
-Whale Bot v3_fixed - V3 entries with FIXED bracket exits.
-Global exposure cap + correlation check enforced.
+Whale Bot v3_fixed - Fixed bracket exits.
+Supabase storage backend.
 """
 
 import os, time, logging
@@ -12,20 +12,16 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 import yfinance as yf
-from pyairtable import Api
 
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
     drawdown_check, get_rsi_sma, run_is_dry, should_halt, http_get, http_post,
-    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees
+    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees,
+    _sb, SUPABASE_URL, SUPABASE_KEY
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_ID = os.environ.get("AIRTABLE_TABLE_ID")
-AIRTABLE_EXITS_TABLE_ID = os.environ.get("AIRTABLE_EXITS_TABLE_ID")
 
 WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT"]
 STOP_LOSS_PCT = 0.025
@@ -41,22 +37,22 @@ client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
 def log_entry(sym, qty, price, stop, target):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]): return
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID).create({
-            "Timestamp": datetime.now().isoformat(), "Symbol": sym, "Side": "BUY",
-            "Qty": qty, "Price": price, "Stop": stop, "Target": target,
-            "Score": 3, "Threshold": 3,
-            "Signal Breakdown": "{'source':'v3_fixed','regime':True,'rsi':True,'sma':True}"
-        })
+        if not SUPABASE_URL or not SUPABASE_KEY: return
+        _sb().table("trades").insert({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": sym, "side": "BUY",
+            "qty": qty, "price": price, "stop": stop, "target": target,
+            "score": 3, "threshold": 3,
+            "signal_breakdown": "{'source':'v3_fixed','regime':True,'rsi':True,'sma':True}"
+        }).execute()
     except Exception as e: L(f"⚠️ entry log: {e}")
 
 def log_exits_from_broker():
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
+        if not SUPABASE_URL or not SUPABASE_KEY: return
         closed = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
-        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID)
-        existing = table.all(fields=["Exit Timestamp", "Symbol"])
-        seen = {f"{r['fields'].get('Symbol')}_{r['fields'].get('Exit Timestamp')}" for r in existing}
+        existing = _sb().table("exits").select("symbol, exit_timestamp").execute()
+        seen = {f"{r['symbol']}_{r['exit_timestamp']}" for r in (existing.data or [])}
         for o in closed:
             if o.side != OrderSide.SELL or not o.filled_at or not o.filled_avg_price: continue
             ts = o.filled_at.isoformat()
@@ -74,16 +70,15 @@ def log_exits_from_broker():
                 if o.order_type.value == "stop": reason = "STOP_LOSS"
                 elif o.order_type.value == "limit": reason = "TAKE_PROFIT"
             except Exception: pass
-            table.create({
-                "Exit Timestamp": ts, "Symbol": o.symbol,
-                "Entry Price": round(ep, 2), "Exit Price": round(xp, 2),
-                "Qty": q, "Exit Reason": reason,
-                "PnL Dollars": round(pd_, 2), "PnL Percent": round(pp_, 2),
-                "Signals That Fired": "v3_fixed", "Signal Score": 3, "Signal Threshold": 3,
-                "Source": "v3_fixed",
-                "Fees": fees
-            })
-            L(f"📕 v3_fixed exit {o.symbol}: ${pd_:.2f} fees ${fees:.4f}")
+            _sb().table("exits").insert({
+                "exit_timestamp": ts, "symbol": o.symbol,
+                "entry_price": round(ep, 2), "exit_price": round(xp, 2),
+                "qty": q, "exit_reason": reason,
+                "pnl_dollars": round(pd_, 2), "pnl_percent": round(pp_, 2),
+                "signals_that_fired": "v3_fixed", "signal_score": 3, "signal_threshold": 3,
+                "source": "v3_fixed", "fees": fees
+            }).execute()
+            L(f"📕 v3_fixed exit {o.symbol}: ${pd_:.2f}")
             send_telegram(f"📕 *v3_fixed exit*: {o.symbol} | ${pd_:.2f}")
     except Exception as e: L(f"⚠️ log exits: {e}")
 
@@ -149,9 +144,7 @@ def run():
         L("market closed"); log_run("v3_fixed", "market_closed"); return
 
     if should_halt("v3_fixed"):
-        L("🛑 halted")
-        log_run("v3_fixed", "error", error="halted due to consecutive failures")
-        return
+        L("🛑 halted"); log_run("v3_fixed", "error", error="halted"); return
 
     if drawdown_check(client, 0.05, L):
         log_run("v3_fixed", "error", error="drawdown halt"); return
