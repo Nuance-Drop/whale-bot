@@ -1,7 +1,6 @@
 """
 Shared utilities for all Whale Bots.
-Centralized API calls, Airtable-backed drawdown, failure tracking,
-GLOBAL exposure cap, regulatory fees, correlation checks.
+Supabase-backed storage. Unlimited API calls, free forever.
 """
 
 import os, time, json, random, logging, requests
@@ -12,12 +11,22 @@ import pandas as pd
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_RUNS_TABLE_ID = os.environ.get("AIRTABLE_RUNS_TABLE_ID")
-AIRTABLE_PEAK_TABLE_ID = os.environ.get("AIRTABLE_PEAK_TABLE_ID")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 GLOBAL_EXPOSURE_CAP_PCT = float(os.environ.get("GLOBAL_EXPOSURE_CAP_PCT", "0.30"))
+
+# ============================================================
+# SUPABASE CLIENT (lazy init)
+# ============================================================
+_sb_client = None
+
+def _sb():
+    global _sb_client
+    if _sb_client is None:
+        from supabase import create_client
+        _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _sb_client
 
 # ============================================================
 # LOGGER
@@ -69,72 +78,50 @@ def send_telegram(msg):
         pass
 
 # ============================================================
-# AIRTABLE — Runs
+# SUPABASE — Runs
 # ============================================================
 def log_run(bot_name, status, equity=None, positions=0, threshold=None,
             top_candidate=None, top_score=None, action="", error=""):
+    if status == "no_signal" and not error:
+        return
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_RUNS_TABLE_ID]):
+        if not SUPABASE_URL or not SUPABASE_KEY:
             return
-        from pyairtable import Api
         payload = {
-            "Timestamp": datetime.now().isoformat(),
-            "Bot": bot_name,
-            "Status": status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "bot": bot_name,
+            "status": status,
+            "positions_held": int(positions),
         }
-        if equity is not None: payload["Equity"] = round(float(equity), 2)
-        payload["Positions Held"] = int(positions)
-        if threshold is not None: payload["Threshold"] = round(float(threshold), 2)
-        if top_candidate: payload["Top Candidate"] = top_candidate
-        if top_score is not None: payload["Top Score"] = round(float(top_score), 2)
-        if action: payload["Action Taken"] = action[:500]
-        if error: payload["Error"] = str(error)[:500]
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_RUNS_TABLE_ID).create(payload)
+        if equity is not None: payload["equity"] = round(float(equity), 2)
+        if threshold is not None: payload["threshold"] = round(float(threshold), 2)
+        if top_candidate: payload["top_candidate"] = top_candidate
+        if top_score is not None: payload["top_score"] = round(float(top_score), 2)
+        if action: payload["action_taken"] = action[:500]
+        if error: payload["error"] = str(error)[:500]
+        _sb().table("runs").insert(payload).execute()
     except Exception:
         pass
 
 # ============================================================
-# AIRTABLE — Peak
+# SUPABASE — Peak
 # ============================================================
-def _find_numeric_field(fields, preferred=("Value", "value", "Peak", "peak", "Equity", "equity")):
-    for k in preferred:
-        if k in fields:
-            try:
-                return k, float(fields[k])
-            except (ValueError, TypeError):
-                continue
-    for k, v in fields.items():
-        if isinstance(v, (int, float)):
-            return k, float(v)
-    return None, None
-
 def get_peak_equity():
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_PEAK_TABLE_ID]):
+        if not SUPABASE_URL or not SUPABASE_KEY:
             return None
-        from pyairtable import Api
-        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_PEAK_TABLE_ID)
-        rows = table.all()
-        if not rows: return None
-        _, val = _find_numeric_field(rows[0]['fields'])
-        return val
+        r = _sb().table("peak").select("value").eq("key", "peak_equity").execute()
+        if r.data and len(r.data) > 0:
+            return float(r.data[0]["value"])
+        return None
     except Exception:
         return None
 
 def set_peak_equity(value):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_PEAK_TABLE_ID]):
+        if not SUPABASE_URL or not SUPABASE_KEY:
             return
-        from pyairtable import Api
-        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_PEAK_TABLE_ID)
-        rows = table.all()
-        if rows:
-            field_name, _ = _find_numeric_field(rows[0]['fields'])
-            if not field_name:
-                field_name = "Value"
-            table.update(rows[0]['id'], {field_name: round(float(value), 4)})
-        else:
-            table.create({"Value": round(float(value), 4)})
+        _sb().table("peak").update({"value": round(float(value), 4)}).eq("key", "peak_equity").execute()
     except Exception:
         pass
 
@@ -143,14 +130,12 @@ def set_peak_equity(value):
 # ============================================================
 def consecutive_failures(bot_name, lookback=3):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_RUNS_TABLE_ID]):
+        if not SUPABASE_URL or not SUPABASE_KEY:
             return 0
-        from pyairtable import Api
-        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_RUNS_TABLE_ID)
-        rows = table.all(formula=f"{{Bot}}='{bot_name}'", sort=["-Timestamp"])[:lookback]
+        r = _sb().table("runs").select("status").eq("bot", bot_name).order("timestamp", desc=True).limit(lookback).execute()
         count = 0
-        for r in rows:
-            if r['fields'].get('Status') == 'error':
+        for row in (r.data or []):
+            if row.get("status") == "error":
                 count += 1
             else:
                 break
@@ -300,10 +285,6 @@ def would_exceed_global_cap(client, new_position_value, log_fn=None):
 # CORRELATION CHECK
 # ============================================================
 def positions_correlation_risk(candidate_symbol, existing_symbols, threshold=0.7, log_fn=None):
-    """
-    Check if candidate_symbol is highly correlated with any existing position.
-    Returns (ok_to_trade, highest_corr, correlated_with).
-    """
     if not existing_symbols:
         return True, 0.0, None
     try:
@@ -315,7 +296,6 @@ def positions_correlation_risk(candidate_symbol, existing_symbols, threshold=0.7
         returns = data.pct_change().dropna()
         if len(returns) < 10:
             return True, 0.0, None
-
         candidate_ret = returns[candidate_symbol]
         worst = 0.0
         worst_sym = None
@@ -329,7 +309,6 @@ def positions_correlation_risk(candidate_symbol, existing_symbols, threshold=0.7
             if abs(corr) > abs(worst):
                 worst = corr
                 worst_sym = s
-
         ok = abs(worst) <= threshold
         if log_fn:
             log_fn(f"  🔗 correlation: {candidate_symbol} vs existing = {worst:+.2f} "
@@ -344,13 +323,6 @@ def positions_correlation_risk(candidate_symbol, existing_symbols, threshold=0.7
 # REGULATORY FEES
 # ============================================================
 def estimate_regulatory_fees(exit_price, qty):
-    """
-    Estimate US equity regulatory fees on a SELL order.
-    - SEC fee: $27.80 per $1,000,000 of proceeds
-    - FINRA TAF: $0.000166 per share
-    - CAT fee: $0.000114 per trade
-    Returns total fees in dollars.
-    """
     proceeds = exit_price * qty
     sec_fee = proceeds * 0.0000278
     finra_fee = max(qty * 0.000166, 0.01)
