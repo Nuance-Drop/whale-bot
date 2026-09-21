@@ -1,6 +1,6 @@
 """
-Whale Bot V3 - Backtested strategy. Trades SPY, QQQ, AAPL, MSFT. Trailing stops.
-Multi-stop bug fixed. Global exposure cap + correlation check enforced.
+Whale Bot V3 - Trailing-stop bot. Trades SPY, QQQ, AAPL, MSFT.
+Supabase storage backend.
 """
 
 import os, time, logging
@@ -13,21 +13,16 @@ from alpaca.trading.requests import (
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 import yfinance as yf
 import pandas as pd
-from pyairtable import Api
 
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
     drawdown_check, get_rsi_sma, get_peak_since, run_is_dry, should_halt,
     http_get, http_post, would_exceed_global_cap, positions_correlation_risk,
-    estimate_regulatory_fees
+    estimate_regulatory_fees, _sb, SUPABASE_URL, SUPABASE_KEY
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_ID = os.environ.get("AIRTABLE_TABLE_ID")
-AIRTABLE_EXITS_TABLE_ID = os.environ.get("AIRTABLE_EXITS_TABLE_ID")
 
 WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT"]
 INITIAL_STOP_PCT = 0.025
@@ -58,43 +53,42 @@ def all_open_stops(sym):
 
 def log_entry(sym, qty, price, stop, score):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]): return
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID).create({
-            "Timestamp": datetime.now().isoformat(), "Symbol": sym, "Side": "BUY",
-            "Qty": qty, "Price": price, "Stop": stop,
-            "Target": round(price*1.10, 2), "Score": score, "Threshold": 3,
-            "Signal Breakdown": "{'source':'v3','regime':True,'rsi':True,'sma':True}"
-        })
+        if not SUPABASE_URL or not SUPABASE_KEY: return
+        _sb().table("trades").insert({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": sym, "side": "BUY",
+            "qty": qty, "price": price, "stop": stop,
+            "target": round(price*1.10, 2), "score": score, "threshold": 3,
+            "signal_breakdown": "{'source':'v3','regime':True,'rsi':True,'sma':True}"
+        }).execute()
     except Exception as e: L(f"⚠️ entry log: {e}")
 
 def log_exit(sym, entry, exit_price, qty, peak=None):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
+        if not SUPABASE_URL or not SUPABASE_KEY: return
         pd_ = (exit_price - entry) * qty
         pp_ = (exit_price - entry) / entry * 100
         fees = estimate_regulatory_fees(exit_price, qty)
         payload = {
-            "Exit Timestamp": datetime.now().isoformat(), "Symbol": sym,
-            "Entry Price": round(entry, 2), "Exit Price": round(exit_price, 2),
-            "Qty": qty, "Exit Reason": "STOP_LOSS",
-            "PnL Dollars": round(pd_, 2), "PnL Percent": round(pp_, 2),
-            "Signals That Fired": "v3", "Signal Score": 3, "Signal Threshold": 3,
-            "Source": "v3",
-            "Fees": fees
+            "exit_timestamp": datetime.now(timezone.utc).isoformat(), "symbol": sym,
+            "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+            "qty": qty, "exit_reason": "STOP_LOSS",
+            "pnl_dollars": round(pd_, 2), "pnl_percent": round(pp_, 2),
+            "signals_that_fired": "v3", "signal_score": 3, "signal_threshold": 3,
+            "source": "v3", "fees": fees
         }
-        if peak: payload["Peak Price"] = round(peak, 4)
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID).create(payload)
-        L(f"📕 v3 exit {sym}: ${pd_:.2f} peak ${peak} fees ${fees:.4f}")
+        if peak: payload["peak_price"] = round(peak, 4)
+        _sb().table("exits").insert(payload).execute()
+        L(f"📕 v3 exit {sym}: ${pd_:.2f} peak ${peak}")
         send_telegram(f"📕 *v3 exit*: {sym} | ${pd_:.2f} | peak ${peak}")
     except Exception as e: L(f"⚠️ exit log: {e}")
 
 def log_exits_from_broker():
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
+        if not SUPABASE_URL or not SUPABASE_KEY: return
         closed = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
-        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID)
-        existing = table.all(fields=["Exit Timestamp", "Symbol"])
-        seen = {f"{r['fields'].get('Symbol')}_{r['fields'].get('Exit Timestamp')}" for r in existing}
+        existing = _sb().table("exits").select("symbol, exit_timestamp").execute()
+        seen = {f"{r['symbol']}_{r['exit_timestamp']}" for r in (existing.data or [])}
         for o in closed:
             if o.side != OrderSide.SELL or not o.filled_at or not o.filled_avg_price: continue
             ts = o.filled_at.isoformat()
@@ -135,11 +129,8 @@ def update_trails():
         if len(stops) > 1:
             L(f"  🚨 {sym}: found {len(stops)} stops, cancelling extras")
             for s in stops:
-                try:
-                    client.cancel_order_by_id(s.id)
-                    L(f"  {sym}: cancelled stop @ ${s.stop_price}")
-                except Exception as e:
-                    L(f"  {sym}: cancel failed: {e}")
+                try: client.cancel_order_by_id(s.id)
+                except Exception as e: L(f"  {sym}: cancel failed: {e}")
             time.sleep(2)
             stops = []
             tightest = None
@@ -150,11 +141,8 @@ def update_trails():
 
         if stops:
             for s in stops:
-                try:
-                    client.cancel_order_by_id(s.id)
-                    L(f"  {sym}: cancelled stop @ ${s.stop_price}")
-                except Exception as e:
-                    L(f"  {sym}: cancel failed: {e}")
+                try: client.cancel_order_by_id(s.id)
+                except Exception as e: L(f"  {sym}: cancel failed: {e}")
             time.sleep(2)
 
         if run_is_dry():
@@ -189,11 +177,9 @@ def try_entry():
         return "skipped"
 
     for sym in WATCHLIST:
-        if sym in held:
-            continue
+        if sym in held: continue
         rsi, close, sma = get_rsi_sma(sym)
-        if rsi is None:
-            continue
+        if rsi is None: continue
         L(f"  {sym}: RSI {rsi:.1f} Close ${close:.2f} SMA50 ${sma:.2f}")
         if 35 < rsi < 55 and close > sma:
             stop = round(close * (1 - INITIAL_STOP_PCT), 2)
@@ -201,8 +187,7 @@ def try_entry():
             risk = eq * RISK_PER_TRADE
             rps = close * INITIAL_STOP_PCT
             qty = min(int(risk/rps), int(remaining/close))
-            if qty < 1:
-                continue
+            if qty < 1: continue
 
             new_position_value = qty * close
             ok, exposure, gcap, _ = would_exceed_global_cap(client, new_position_value, L)
@@ -218,7 +203,6 @@ def try_entry():
 
             L(f"🎯 V3 ENTRY {sym} qty {qty} @ ${close:.2f} stop ${stop}")
             if run_is_dry():
-                L(f"🟡 DRY would buy {sym}")
                 send_telegram(f"🟡 *v3 DRY*: {sym} {qty} @ ${close:.2f}")
                 return "traded"
             try:
@@ -252,31 +236,23 @@ def try_entry():
 def run():
     L("="*60); L(f"v3 start {datetime.now().isoformat()}")
     if not is_market_open():
-        L("market closed")
-        log_run("v3", "market_closed")
-        return
+        L("market closed"); log_run("v3", "market_closed"); return
 
     if should_halt("v3"):
-        L("🛑 halted due to consecutive failures")
+        L("🛑 halted")
         log_run("v3", "error", error="halted due to consecutive failures")
         return
 
-    L("--- drawdown ---")
     if drawdown_check(client, 0.05, L):
-        log_run("v3", "error", error="drawdown halt")
-        return
+        log_run("v3", "error", error="drawdown halt"); return
 
     L("--- trails ---")
-    try:
-        update_trails()
-    except Exception as e:
-        L(f"trails: {e}")
+    try: update_trails()
+    except Exception as e: L(f"trails: {e}")
 
     L("--- exits ---")
-    try:
-        log_exits_from_broker()
-    except Exception as e:
-        L(f"exits: {e}")
+    try: log_exits_from_broker()
+    except Exception as e: L(f"exits: {e}")
 
     L("--- entry ---")
     try:
@@ -288,14 +264,11 @@ def run():
         except Exception:
             log_run("v3", status)
     except Exception as e:
-        L(f"entry: {e}")
-        log_run("v3", "error", error=str(e))
+        L(f"entry: {e}"); log_run("v3", "error", error=str(e))
 
     L("="*60)
 
 if __name__ == "__main__":
-    try:
-        run()
+    try: run()
     except Exception as e:
-        L(f"❌ FATAL: {e}")
-        send_telegram(f"❌ v3 fatal: {e}")
+        L(f"❌ FATAL: {e}"); send_telegram(f"❌ v3 fatal: {e}")
