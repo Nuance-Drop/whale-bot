@@ -19,10 +19,8 @@ jobs:
         run: pip install requests numpy pandas
       - name: Run IC update
         env:
-          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
-          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
-          AIRTABLE_EXITS_TABLE_ID: ${{ secrets.AIRTABLE_EXITS_TABLE_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python scripts/weekly_ic_update.py
       - name: Commit weights if changed
         run: |
