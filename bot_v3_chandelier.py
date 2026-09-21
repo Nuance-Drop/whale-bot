@@ -1,6 +1,6 @@
 """
-Whale Bot v3_chandelier - V3 entries with Chandelier trailing stop.
-Global exposure cap + correlation check enforced.
+Whale Bot v3_chandelier - ATR Chandelier trailing stop.
+Supabase storage backend.
 """
 
 import os, time, logging
@@ -13,20 +13,16 @@ from alpaca.trading.requests import (
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 import yfinance as yf
 import pandas as pd
-from pyairtable import Api
 
 from common import (
     get_logger, send_telegram, log_run, is_market_open, is_market_bullish,
     drawdown_check, get_rsi_sma, get_peak_since, run_is_dry, should_halt,
-    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees
+    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees,
+    _sb, SUPABASE_URL, SUPABASE_KEY
 )
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_ID = os.environ.get("AIRTABLE_TABLE_ID")
-AIRTABLE_EXITS_TABLE_ID = os.environ.get("AIRTABLE_EXITS_TABLE_ID")
 
 WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT"]
 INITIAL_STOP_PCT = 0.025
@@ -59,53 +55,50 @@ def all_open_stops(sym):
 def get_atr(sym, lookback=14):
     try:
         df = yf.Ticker(sym).history(period="3mo", interval="1d", auto_adjust=True)
-        if len(df) < lookback + 5:
-            return None
+        if len(df) < lookback + 5: return None
         h, l, c = df['High'], df['Low'], df['Close']
         tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
         return float(tr.iloc[-lookback:].mean())
-    except Exception:
-        return None
+    except Exception: return None
 
 def log_entry(sym, qty, price, stop, score):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]): return
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID).create({
-            "Timestamp": datetime.now().isoformat(), "Symbol": sym, "Side": "BUY",
-            "Qty": qty, "Price": price, "Stop": stop,
-            "Target": round(price*1.20, 2), "Score": score, "Threshold": 3,
-            "Signal Breakdown": "{'source':'v3_chandelier','regime':True,'rsi':True,'sma':True}"
-        })
+        if not SUPABASE_URL or not SUPABASE_KEY: return
+        _sb().table("trades").insert({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": sym, "side": "BUY",
+            "qty": qty, "price": price, "stop": stop,
+            "target": round(price*1.20, 2), "score": score, "threshold": 3,
+            "signal_breakdown": "{'source':'v3_chandelier','regime':True,'rsi':True,'sma':True}"
+        }).execute()
     except Exception as e: L(f"⚠️ entry log: {e}")
 
 def log_exit(sym, entry, exit_price, qty, peak=None):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
+        if not SUPABASE_URL or not SUPABASE_KEY: return
         pd_ = (exit_price - entry) * qty
         pp_ = (exit_price - entry) / entry * 100
         fees = estimate_regulatory_fees(exit_price, qty)
         payload = {
-            "Exit Timestamp": datetime.now().isoformat(), "Symbol": sym,
-            "Entry Price": round(entry, 2), "Exit Price": round(exit_price, 2),
-            "Qty": qty, "Exit Reason": "STOP_LOSS",
-            "PnL Dollars": round(pd_, 2), "PnL Percent": round(pp_, 2),
-            "Signals That Fired": "v3_chandelier", "Signal Score": 3, "Signal Threshold": 3,
-            "Source": "v3_chandelier",
-            "Fees": fees
+            "exit_timestamp": datetime.now(timezone.utc).isoformat(), "symbol": sym,
+            "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+            "qty": qty, "exit_reason": "STOP_LOSS",
+            "pnl_dollars": round(pd_, 2), "pnl_percent": round(pp_, 2),
+            "signals_that_fired": "v3_chandelier", "signal_score": 3, "signal_threshold": 3,
+            "source": "v3_chandelier", "fees": fees
         }
-        if peak: payload["Peak Price"] = round(peak, 4)
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID).create(payload)
-        L(f"📕 v3_chandelier exit {sym}: ${pd_:.2f} peak ${peak} fees ${fees:.4f}")
+        if peak: payload["peak_price"] = round(peak, 4)
+        _sb().table("exits").insert(payload).execute()
+        L(f"📕 v3_chandelier exit {sym}: ${pd_:.2f} peak ${peak}")
         send_telegram(f"📕 *v3_chandelier exit*: {sym} | ${pd_:.2f}")
     except Exception as e: L(f"⚠️ exit log: {e}")
 
 def log_exits_from_broker():
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
+        if not SUPABASE_URL or not SUPABASE_KEY: return
         closed = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
-        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID)
-        existing = table.all(fields=["Exit Timestamp", "Symbol"])
-        seen = {f"{r['fields'].get('Symbol')}_{r['fields'].get('Exit Timestamp')}" for r in existing}
+        existing = _sb().table("exits").select("symbol, exit_timestamp").execute()
+        seen = {f"{r['symbol']}_{r['exit_timestamp']}" for r in (existing.data or [])}
         for o in closed:
             if o.side != OrderSide.SELL or not o.filled_at or not o.filled_avg_price: continue
             ts = o.filled_at.isoformat()
