@@ -1,6 +1,7 @@
 """
 Whale Bot Dashboard v9 — Live Trading + Research Lab.
 Fixed attribution via Source column. Net P/L after fees.
+Supabase storage backend.
 """
 
 import streamlit as st
@@ -29,31 +30,20 @@ iframe { width: 100% !important; max-width: 100vw !important; display: block !im
 </style>
 """, unsafe_allow_html=True)
 
-AIRTABLE_API_KEY = st.secrets["AIRTABLE_API_KEY"]
-BASE_ID = st.secrets["AIRTABLE_BASE_ID"]
-TRADES_ID = st.secrets["AIRTABLE_TABLE_ID"]
-EXITS_ID = st.secrets["AIRTABLE_EXITS_TABLE_ID"]
-FILLS_ID = st.secrets["AIRTABLE_FILLS_TABLE_ID"]
-RUNS_ID = st.secrets.get("AIRTABLE_RUNS_TABLE_ID", "")
-SIGNALS_ID = st.secrets.get("AIRTABLE_SIGNALS_TABLE_ID", "")
-ASTRO_ID = st.secrets.get("AIRTABLE_ASTRO_TABLE_ID", "")
-REFLEXIVE_ID = st.secrets.get("AIRTABLE_REFLEXIVE_TABLE_ID", "")
-MAB_ID = st.secrets.get("AIRTABLE_MAB_TABLE_ID", "")
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-BASE = f"https://api.airtable.com/v0/{BASE_ID}"
-H = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-
-@st.cache_data(ttl=60)
-def fetch(table_id):
-    if not table_id: return []
-    out, params = [], {}
-    while True:
-        r = requests.get(f"{BASE}/{table_id}", headers=H, params=params, timeout=30)
-        d = r.json()
-        out.extend(d.get("records", []))
-        if not d.get("offset"): break
-        params["offset"] = d["offset"]
-    return [rec["fields"] for rec in out]
+@st.cache_data(ttl=300)
+def fetch_sb(table_name, limit=500):
+    if not SUPABASE_URL or not SUPABASE_KEY: return []
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        r = sb.table(table_name).select("*").order("created_at", desc=True).limit(limit).execute()
+        return r.data or []
+    except Exception as e:
+        st.error(f"Supabase fetch failed for {table_name}: {e}")
+        return []
 
 def clean_for_json(obj):
     if isinstance(obj, float):
@@ -65,41 +55,35 @@ def clean_for_json(obj):
 
 tab_live, tab_research = st.tabs(["📊 Live Trading", "✨ Research Lab"])
 
-# ============================================================
-# TAB 1: LIVE TRADING
-# ============================================================
 with tab_live:
-    try:
-        trades = fetch(TRADES_ID)
-        exits = fetch(EXITS_ID)
-        fills = fetch(FILLS_ID)
-        runs = fetch(RUNS_ID) if RUNS_ID else []
-        signals = fetch(SIGNALS_ID) if SIGNALS_ID else []
-    except Exception as e:
-        st.error(f"Airtable: {e}"); st.stop()
+    trades = fetch_sb("trades")
+    exits = fetch_sb("exits")
+    fills = fetch_sb("fills")
+    runs = fetch_sb("runs")
+    signals = fetch_sb("signals")
 
     for f in fills:
-        if "Slippage (%)" not in f and "Slippage ($)" in f and "Expected Price" in f:
-            ep = f.get("Expected Price", 0)
-            if ep: f["Slippage (%)"] = round((f["Slippage ($)"]/ep)*100, 4)
+        if "slippage_percent" not in f and "slippage_dollars" in f and "expected_price" in f:
+            ep = f.get("expected_price", 0)
+            if ep: f["slippage_percent"] = round((f["slippage_dollars"]/ep)*100, 4)
 
-    total_pnl = sum(e.get("PnL Dollars", 0) for e in exits)
-    total_fees = sum(e.get("Fees", 0) for e in exits)
+    total_pnl = sum(e.get("pnl_dollars", 0) for e in exits)
+    total_fees = sum(e.get("fees", 0) for e in exits)
     net_pnl = total_pnl - total_fees
 
-    wins = sum(1 for e in exits if e.get("PnL Dollars", 0) > 0)
+    wins = sum(1 for e in exits if e.get("pnl_dollars", 0) > 0)
     win_rate = (wins/len(exits)*100) if exits else 0
     open_trades = max(len(trades) - len(exits), 0)
 
-    exits_sorted = sorted(exits, key=lambda x: x.get("Exit Timestamp", ""))
+    exits_sorted = sorted(exits, key=lambda x: x.get("exit_timestamp", ""))
     cum = 0; equity_points = []
     for e in exits_sorted:
-        cum += e.get("PnL Dollars", 0) - e.get("Fees", 0)
-        equity_points.append({"t": e.get("Exit Timestamp", ""), "v": round(cum, 2)})
+        cum += e.get("pnl_dollars", 0) - e.get("fees", 0)
+        equity_points.append({"t": e.get("exit_timestamp", ""), "v": round(cum, 2)})
 
     by_symbol = {}
     for e in exits:
-        s = e.get("Symbol", "?"); by_symbol[s] = by_symbol.get(s, 0) + e.get("PnL Dollars", 0)
+        s = e.get("symbol", "?"); by_symbol[s] = by_symbol.get(s, 0) + e.get("pnl_dollars", 0)
 
     sample_size = len(exits)
     sample_pct = min(sample_size/90*100, 100)
@@ -107,14 +91,12 @@ with tab_live:
     signal_fires = {"regime":0,"rsi":0,"sma":0,"sentiment":0,"congress":0,"insider":0,"pead":0,"flow":0}
     for s in signals:
         for k in signal_fires:
-            if s.get(k.capitalize()) or s.get(k): signal_fires[k] += 1
+            if s.get(k): signal_fires[k] += 1
 
-    # --- ATTRIBUTION FIX: read Source column, fallback to Signal Breakdown ---
     def detect_source(record):
-        src = record.get("Source", "")
-        if src:
-            return str(src).lower()
-        sb = record.get("Signal Breakdown", "") or ""
+        src = record.get("source", "")
+        if src: return str(src).lower()
+        sb = record.get("signal_breakdown", "") or ""
         if "v3_chandelier" in sb: return "v3_chandelier"
         if "v3_fixed" in sb: return "v3_fixed"
         if "v3" in sb: return "v3"
@@ -232,41 +214,33 @@ function renderTable(id, rows, fields, headers, emptyMsg) {{
     }});
     html += '</tbody></table>'; panel.innerHTML = html;
 }}
-renderTable('trades-panel', DATA.trades, ['Timestamp','Symbol','Qty','Price','Score','Threshold'], ['Time','Symbol','Qty','Price','Score','Thr'], '🌊 No trades yet.');
-renderTable('exits-panel', DATA.exits, ['Exit Timestamp','Symbol','Exit Reason','PnL Dollars','Source','Fees'], ['Time','Symbol','Reason','P/L $','Source','Fees'], '🌊 No exits yet.');
+renderTable('trades-panel', DATA.trades, ['timestamp','symbol','qty','price','score','threshold'], ['Time','Symbol','Qty','Price','Score','Thr'], '🌊 No trades yet.');
+renderTable('exits-panel', DATA.exits, ['exit_timestamp','symbol','exit_reason','pnl_dollars','source','fees'], ['Time','Symbol','Reason','P/L $','Source','Fees'], '🌊 No exits yet.');
 </script>
 </body></html>"""
     components.html(LIVE_HTML, height=1700, scrolling=True)
 
-
-# ============================================================
-# TAB 2: RESEARCH LAB
-# ============================================================
 with tab_research:
-    try:
-        astro_rows = fetch(ASTRO_ID) if ASTRO_ID else []
-        reflexive_rows = fetch(REFLEXIVE_ID) if REFLEXIVE_ID else []
-        mab_rows = fetch(MAB_ID) if MAB_ID else []
-        signals_rows = fetch(SIGNALS_ID) if SIGNALS_ID else []
-        exits_for_viz = fetch(EXITS_ID)
-    except Exception as e:
-        st.error(f"Research fetch failed: {e}")
-        astro_rows, reflexive_rows, mab_rows, signals_rows, exits_for_viz = [], [], [], [], []
+    astro_rows = fetch_sb("astro")
+    reflexive_rows = fetch_sb("reflexive")
+    mab_rows = fetch_sb("mab_weights")
+    signals_rows = fetch_sb("signals")
+    exits_for_viz = fetch_sb("exits")
 
     current_astro = {}
     if astro_rows:
-        nyse = sorted([a for a in astro_rows if a.get('Reference') == 'NYSE'], key=lambda x: x.get('Timestamp',''))
+        nyse = sorted([a for a in astro_rows if a.get('reference') == 'NYSE'], key=lambda x: x.get('timestamp',''))
         if nyse: current_astro = nyse[-1]
 
     current_reflexive = {}
     if reflexive_rows:
-        srtd = sorted(reflexive_rows, key=lambda x: x.get('Timestamp',''))
+        srtd = sorted(reflexive_rows, key=lambda x: x.get('timestamp',''))
         current_reflexive = srtd[-1]
 
     mab_latest = {}
     if mab_rows:
-        for r in sorted(mab_rows, key=lambda x: x.get('Timestamp','')):
-            mab_latest[r.get('Signal')] = float(r.get('Weight', 0))
+        for r in sorted(mab_rows, key=lambda x: x.get('timestamp','')):
+            mab_latest[r.get('signal')] = float(r.get('weight', 0))
 
     try:
         from visualizer import narrate_state, build_state_space_figure, build_signal_heatmap
@@ -330,31 +304,31 @@ with tab_research:
         st.markdown("### 🔥 Signal Fire Heatmap")
         st.plotly_chart(fig_heatmap, use_container_width=True)
 
-    astro_display = float(current_astro.get('Astro_Score', 0))
+    astro_display = float(current_astro.get('astro_score', 0))
     astro_pct = max(0, min(100, (astro_display + 10) * 5))
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("#### 🌙 Planetary State")
         st.markdown(f"""
-        - **Sun:** {current_astro.get('Sun_Sign','—')} {current_astro.get('Sun_Degree',0)}°
-        - **Moon:** {current_astro.get('Moon_Sign','—')} | {current_astro.get('Moon_Phase','—')} ({current_astro.get('Moon_Illumination',0)}%)
-        - **Mercury Rx:** {'☿ Yes' if current_astro.get('Mercury_Retrograde') else 'Direct'}
-        - **Jupiter:** {current_astro.get('Jupiter_Sign','—')}
-        - **Saturn:** {current_astro.get('Saturn_Sign','—')}
-        - **Nakshatra:** {current_astro.get('Nakshatra','—')}
+        - **Sun:** {current_astro.get('sun_sign','—')} {current_astro.get('sun_degree',0)}°
+        - **Moon:** {current_astro.get('moon_sign','—')} | {current_astro.get('moon_phase','—')} ({current_astro.get('moon_illumination',0)}%)
+        - **Mercury Rx:** {'☿ Yes' if current_astro.get('mercury_retrograde') else 'Direct'}
+        - **Jupiter:** {current_astro.get('jupiter_sign','—')}
+        - **Saturn:** {current_astro.get('saturn_sign','—')}
+        - **Nakshatra:** {current_astro.get('nakshatra','—')}
         """)
         st.progress(astro_pct / 100, text=f"Astro Score: {astro_display:+.1f}")
 
     with col2:
         st.markdown("#### 🌀 Reflexive Intensity")
-        intensity = float(current_reflexive.get('Reflexive_Intensity', 0))
+        intensity = float(current_reflexive.get('reflexive_intensity', 0))
         st.metric("Intensity", f"{intensity:.1f}/10")
         st.markdown(f"""
-        - **VIX:** {current_reflexive.get('VIX_Spot',0)} ({current_reflexive.get('VIX_Term_Structure','—')})
-        - **Cross-corr:** {current_reflexive.get('Cross_Ticker_Correlation',0):.3f}
-        - **SPY/VIX:** {current_reflexive.get('SPY_VIX_Correlation',0):.3f}
-        - **Volume Z:** {current_reflexive.get('Volume_Z_Score',0):+.2f}
+        - **VIX:** {current_reflexive.get('vix_spot',0)} ({current_reflexive.get('vix_term_structure','—')})
+        - **Cross-corr:** {current_reflexive.get('cross_ticker_correlation',0):.3f}
+        - **SPY/VIX:** {current_reflexive.get('spy_vix_correlation',0):.3f}
+        - **Volume Z:** {current_reflexive.get('volume_z_score',0):+.2f}
         """)
 
     st.markdown("#### ⚖️ Adaptive Signal Weights")
