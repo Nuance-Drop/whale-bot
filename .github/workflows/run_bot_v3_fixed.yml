@@ -27,11 +27,8 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
-          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
-          AIRTABLE_EXITS_TABLE_ID: ${{ secrets.AIRTABLE_EXITS_TABLE_ID }}
-          AIRTABLE_RUNS_TABLE_ID: ${{ secrets.AIRTABLE_RUNS_TABLE_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python bot_v3_fixed.py
       - uses: actions/upload-artifact@v4
         if: always()
