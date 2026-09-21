@@ -1,27 +1,22 @@
 """
-Signal Shadow Bot - Logs every signal independently for IC analysis.
+Signal Shadow Bot - Logs every signal independently.
+Supabase storage backend.
 """
 
 import os, json
 from datetime import datetime, timezone, timedelta
-from alpaca.trading.client import TradingClient
+
 import yfinance as yf
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from pyairtable import Api
 
 from common import (
     get_logger, safe_request, log_run, is_market_open, is_market_bullish,
-    get_rsi_sma
+    get_rsi_sma, _sb, SUPABASE_URL, SUPABASE_KEY
 )
 
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 BARGO_API_KEY = os.environ.get("BARGO_API_KEY")
 FORM4API_KEY = os.environ.get("FORM4API_KEY")
-AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_SIGNALS_TABLE_ID = os.environ.get("AIRTABLE_SIGNALS_TABLE_ID")
 
 WATCHLIST = ["SPY","QQQ","AAPL","MSFT","NVDA","GOOGL","META","AMZN"]
 log = get_logger("shadow", "shadow_bot.log")
@@ -95,23 +90,21 @@ def run():
         rsi_ok = rsi is not None and 35 < rsi < 55
         sma_ok = rsi is not None and close > sma
         sent, sent_val = s_sent(sym)
-        con = s_congress(sym)
-        ins = s_insider(sym)
-        pead = s_pead(sym)
-        flow = s_flow(sym)
+        con = s_congress(sym); ins = s_insider(sym)
+        pead = s_pead(sym); flow = s_flow(sym)
         rows.append({
-            "Timestamp": datetime.now().isoformat(), "Symbol": sym,
-            "Regime": regime, "RSI": rsi_ok, "SMA": sma_ok,
-            "Sentiment": sent, "Sentiment Score": sent_val,
-            "Congress": con, "Insider": ins, "PEAD": pead, "Flow": flow,
-            "Source": "shadow"
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": sym,
+            "regime": regime, "rsi": rsi_ok, "sma": sma_ok,
+            "sentiment": sent, "sentiment_score": sent_val,
+            "congress": con, "insider": ins, "pead": pead, "flow": flow,
+            "source": "shadow"
         })
         L(f"  {sym}: regime={regime} rsi={rsi_ok} sma={sma_ok} sent={sent} "
           f"congress={con} insider={ins} pead={pead} flow={flow}")
     try:
-        if all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_SIGNALS_TABLE_ID]):
-            Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_SIGNALS_TABLE_ID).batch_create(
-                [{"fields": r} for r in rows])
+        if SUPABASE_URL and SUPABASE_KEY:
+            _sb().table("signals").insert(rows).execute()
             L(f"✅ logged {len(rows)} shadow rows")
     except Exception as e:
         L(f"⚠️ shadow log: {e}")
@@ -121,4 +114,4 @@ def run():
 if __name__ == "__main__":
     try: run()
     except Exception as e:
-        L(f"❌ shadow FATAL: {e}")
+        L(f"❌ FATAL: {e}")
