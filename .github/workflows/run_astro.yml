@@ -24,14 +24,12 @@ jobs:
       - name: Run Astro
         env:
           OPENEPHEMERIS_API_KEY: ${{ secrets.OPENEPHEMERIS_API_KEY }}
-          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
-          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_ASTRO_TABLE_ID: ${{ secrets.AIRTABLE_ASTRO_TABLE_ID }}
-          AIRTABLE_RUNS_TABLE_ID: ${{ secrets.AIRTABLE_RUNS_TABLE_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LOCAL_LAT: ${{ secrets.LOCAL_LAT }}
           LOCAL_LON: ${{ secrets.LOCAL_LON }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python bot_astro.py
       - uses: actions/upload-artifact@v4
         if: always()
