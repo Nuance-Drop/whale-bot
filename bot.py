@@ -1,6 +1,6 @@
 """
-Whale Bot v10 - Full 8-signal trading with adaptive Thompson Sampling weights.
-Global exposure cap + correlation check enforced.
+Whale Bot v10 - 8-signal confluence trader.
+Supabase storage backend.
 """
 
 import os, csv, time, json, logging, traceback
@@ -15,13 +15,13 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderS
 import yfinance as yf
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from pyairtable import Api
 
 from common import (
     get_logger, safe_request, send_telegram, log_run, is_market_open,
     is_market_bullish, drawdown_check, get_vix, spy_strength_pct,
     get_rsi_sma, run_is_dry, should_halt, http_get, http_post,
-    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees
+    would_exceed_global_cap, positions_correlation_risk, estimate_regulatory_fees,
+    _sb, SUPABASE_URL, SUPABASE_KEY
 )
 
 try:
@@ -38,11 +38,6 @@ ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 BARGO_API_KEY = os.environ.get("BARGO_API_KEY")
 FORM4API_KEY = os.environ.get("FORM4API_KEY")
-AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_ID = os.environ.get("AIRTABLE_TABLE_ID")
-AIRTABLE_EXITS_TABLE_ID = os.environ.get("AIRTABLE_EXITS_TABLE_ID")
-AIRTABLE_FILLS_TABLE_ID = os.environ.get("AIRTABLE_FILLS_TABLE_ID")
 KALSHI_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID")
 KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY")
 
@@ -209,32 +204,34 @@ def atr_mult(sym, lb=20):
 
 def log_entry(sym, qty, price, stop, target, score, th, sigs):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]): return
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID).create({
-            "Timestamp": datetime.now().isoformat(), "Symbol": sym, "Side": "BUY",
-            "Qty": qty, "Price": price, "Stop": stop, "Target": target,
-            "Score": score, "Threshold": th, "Signal Breakdown": json.dumps(sigs)
-        })
+        if not SUPABASE_URL or not SUPABASE_KEY: return
+        _sb().table("trades").insert({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": sym, "side": "BUY",
+            "qty": qty, "price": price, "stop": stop, "target": target,
+            "score": score, "threshold": th,
+            "signal_breakdown": json.dumps(sigs)
+        }).execute()
     except Exception as e: L(f"⚠️ entry log: {e}")
 
 def log_exit(sym, entry, exit_price, qty, reason, peak=None, sigs=None, pnl_pct=None):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
+        if not SUPABASE_URL or not SUPABASE_KEY: return
         pnl_d = (exit_price - entry) * qty
         pnl_p = (exit_price - entry) / entry * 100 if entry else 0
         fees = estimate_regulatory_fees(exit_price, qty)
         payload = {
-            "Exit Timestamp": datetime.now().isoformat(), "Symbol": sym,
-            "Entry Price": round(entry, 2), "Exit Price": round(exit_price, 2),
-            "Qty": qty, "Exit Reason": reason,
-            "PnL Dollars": round(pnl_d, 2), "PnL Percent": round(pnl_p, 2),
-            "Signals That Fired": json.dumps(sigs) if sigs else "",
-            "Signal Score": 0, "Signal Threshold": 0,
-            "Source": "v10",
-            "Fees": fees
+            "exit_timestamp": datetime.now(timezone.utc).isoformat(), "symbol": sym,
+            "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+            "qty": qty, "exit_reason": reason,
+            "pnl_dollars": round(pnl_d, 2), "pnl_percent": round(pnl_p, 2),
+            "signals_that_fired": json.dumps(sigs) if sigs else "",
+            "signal_score": 0, "signal_threshold": 0,
+            "source": "v10",
+            "fees": fees
         }
-        if peak: payload["Peak Price"] = round(peak, 4)
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID).create(payload)
+        if peak: payload["peak_price"] = round(peak, 4)
+        _sb().table("exits").insert(payload).execute()
         L(f"📕 exit {sym}: ${pnl_d:.2f} (fees ${fees:.4f})")
         send_telegram(f"📕 *v10 exit*: {sym} | ${pnl_d:.2f}")
         if sigs:
@@ -248,24 +245,24 @@ def log_exit(sym, entry, exit_price, qty, reason, peak=None, sigs=None, pnl_pct=
 
 def log_fill(sym, otype, exp, actual, oid=None):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_FILLS_TABLE_ID]): return
-        sd = actual - exp; sp = (sd / exp) * 100
-        Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_FILLS_TABLE_ID).create({
-            "Timestamp": datetime.now().isoformat(), "Symbol": sym, "Order Type": otype,
-            "Expected Price": round(exp, 4), "Actual Fill Price": round(actual, 4),
-            "Slippage ($)": round(sd, 4), "Slippage (%)": round(sp, 4),
-            "Order ID": str(oid or "")
-        })
+        if not SUPABASE_URL or not SUPABASE_KEY: return
+        sd = actual - exp; sp = (sd / exp) * 100 if exp else 0
+        _sb().table("fills").insert({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": sym, "order_type": otype,
+            "expected_price": round(exp, 4), "actual_fill_price": round(actual, 4),
+            "slippage_dollars": round(sd, 4), "slippage_percent": round(sp, 4),
+            "order_id": str(oid or "")
+        }).execute()
     except Exception as e: L(f"⚠️ fill log: {e}")
 
 def _find_signal_breakdown_in_trades(sym):
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID]):
+        if not SUPABASE_URL or not SUPABASE_KEY:
             return None
-        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID)
-        rows = table.all(formula=f"{{Symbol}}='{sym}'", sort=["-Timestamp"])
-        for r in rows[:5]:
-            sb = r['fields'].get('Signal Breakdown')
+        r = _sb().table("trades").select("signal_breakdown").eq("symbol", sym).order("timestamp", desc=True).limit(5).execute()
+        for row in (r.data or []):
+            sb = row.get("signal_breakdown")
             if sb:
                 try: return json.loads(sb)
                 except Exception: pass
@@ -275,11 +272,10 @@ def _find_signal_breakdown_in_trades(sym):
 
 def log_exits_from_broker():
     try:
-        if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID]): return
+        if not SUPABASE_URL or not SUPABASE_KEY: return
         closed = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
-        table = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_EXITS_TABLE_ID)
-        existing = table.all(fields=["Exit Timestamp", "Symbol"])
-        seen = {f"{r['fields'].get('Symbol')}_{r['fields'].get('Exit Timestamp')}" for r in existing}
+        existing = _sb().table("exits").select("symbol, exit_timestamp").execute()
+        seen = {f"{r['symbol']}_{r['exit_timestamp']}" for r in (existing.data or [])}
         for o in closed:
             if o.side != OrderSide.SELL or not o.filled_at or not o.filled_avg_price: continue
             ts = o.filled_at.isoformat()
