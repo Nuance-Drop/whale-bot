@@ -27,10 +27,8 @@ jobs:
           APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
           FORM4API_KEY: ${{ secrets.FORM4API_KEY }}
           BARGO_API_KEY: ${{ secrets.BARGO_API_KEY }}
-          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
-          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_SIGNALS_TABLE_ID: ${{ secrets.AIRTABLE_SIGNALS_TABLE_ID }}
-          AIRTABLE_RUNS_TABLE_ID: ${{ secrets.AIRTABLE_RUNS_TABLE_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python bot_shadow.py
       - uses: actions/upload-artifact@v4
         if: always()
