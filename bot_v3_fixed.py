@@ -136,7 +136,7 @@ def try_entry():
                     time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
                     take_profit=TakeProfitRequest(limit_price=target),
                     stop_loss=StopLossRequest(stop_price=stop),
-                    client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time())))))
+                    client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time()))))
                 L(f"  ✅ {sym} submitted")
                 log_entry(sym, qty, close, stop, target)
                 send_telegram(f"🚨 *v3_fixed*: {sym} {qty} @ ${close:.2f}\nSL ${stop} TP ${target}")
