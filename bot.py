@@ -48,6 +48,7 @@ MAX_POSITIONS = 2
 TACTICAL_LIMIT_PCT = 0.10
 WEIGHTS_FILE = "signal_weights.json"
 
+BOT_NAME = "v10"
 log = get_logger("v10", "bot.log")
 def L(m): print(m); log.info(m)
 
@@ -214,14 +215,14 @@ def log_entry(sym, qty, price, stop, target, score, th, sigs):
         }).execute()
     except Exception as e: L(f"⚠️ entry log: {e}")
 
-def log_exit(sym, entry, exit_price, qty, reason, peak=None, sigs=None, pnl_pct=None):
+def log_exit(sym, entry, exit_price, qty, reason, peak=None, sigs=None, pnl_pct=None, exit_timestamp=None):
     try:
         if not SUPABASE_URL or not SUPABASE_KEY: return
         pnl_d = (exit_price - entry) * qty
         pnl_p = (exit_price - entry) / entry * 100 if entry else 0
         fees = estimate_regulatory_fees(exit_price, qty)
         payload = {
-            "exit_timestamp": datetime.now(timezone.utc).isoformat(), "symbol": sym,
+            "exit_timestamp": exit_timestamp or datetime.now(timezone.utc).isoformat(), "symbol": sym,
             "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
             "qty": qty, "exit_reason": reason,
             "pnl_dollars": round(pnl_d, 2), "pnl_percent": round(pnl_p, 2),
@@ -280,11 +281,18 @@ def log_exits_from_broker():
             if o.side != OrderSide.SELL or not o.filled_at or not o.filled_avg_price: continue
             ts = o.filled_at.isoformat()
             if f"{o.symbol}_{ts}" in seen: continue
-            ep = None
+            entry_order = None
             for x in closed:
-                if x.symbol == o.symbol and x.side == OrderSide.BUY and x.filled_at and x.filled_avg_price:
-                    ep = float(x.filled_avg_price); break
-            if ep is None: continue
+                if (x.symbol == o.symbol and x.side == OrderSide.BUY
+                    and x.filled_at and x.filled_avg_price
+                    and x.filled_at <= o.filled_at):
+                    if entry_order is None or x.filled_at > entry_order.filled_at:
+                        entry_order = x
+            if entry_order is None: continue
+            cid = (getattr(entry_order, "client_order_id", "") or "")
+            if cid and not cid.startswith(BOT_NAME + "_"):
+                continue
+            ep = float(entry_order.filled_avg_price)
             xp = float(o.filled_avg_price); q = int(o.filled_qty)
             reason = "OTHER"
             try:
@@ -292,7 +300,7 @@ def log_exits_from_broker():
                 elif o.order_type.value == "limit": reason = "TAKE_PROFIT"
             except Exception: pass
             sigs = _find_signal_breakdown_in_trades(o.symbol)
-            log_exit(o.symbol, ep, xp, q, reason, sigs=sigs)
+            log_exit(o.symbol, ep, xp, q, reason, sigs=sigs, exit_timestamp=ts)
     except Exception as e: L(f"⚠️ log_exits: {e}")
 
 def place_bracket(sym, qty, entry, score, th, sigs, mult):
@@ -309,7 +317,8 @@ def place_bracket(sym, qty, entry, score, th, sigs, mult):
             symbol=sym, qty=qty, side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=target),
-            stop_loss=StopLossRequest(stop_price=stop)))
+            stop_loss=StopLossRequest(stop_price=stop,
+            client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time()))))
         time.sleep(2)
         try:
             f = client.get_order_by_id(order.id)
