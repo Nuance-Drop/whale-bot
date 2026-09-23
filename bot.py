@@ -318,7 +318,7 @@ def place_bracket(sym, qty, entry, score, th, sigs, mult):
             time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=target),
             stop_loss=StopLossRequest(stop_price=stop),
-            client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time())))))
+            client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time()))))
         time.sleep(2)
         try:
             f = client.get_order_by_id(order.id)
