@@ -31,6 +31,7 @@ RISK_PER_TRADE = 0.02
 MAX_POSITIONS = 2
 TACTICAL_LIMIT_PCT = 0.10
 
+BOT_NAME = "v3"
 log = get_logger("v3", "v3_bot.log")
 def L(m): print(m); log.info(m)
 
@@ -63,14 +64,14 @@ def log_entry(sym, qty, price, stop, score):
         }).execute()
     except Exception as e: L(f"⚠️ entry log: {e}")
 
-def log_exit(sym, entry, exit_price, qty, peak=None):
+def log_exit(sym, entry, exit_price, qty, peak=None, exit_timestamp=None):
     try:
         if not SUPABASE_URL or not SUPABASE_KEY: return
         pd_ = (exit_price - entry) * qty
         pp_ = (exit_price - entry) / entry * 100
         fees = estimate_regulatory_fees(exit_price, qty)
         payload = {
-            "exit_timestamp": datetime.now(timezone.utc).isoformat(), "symbol": sym,
+            "exit_timestamp": exit_timestamp or datetime.now(timezone.utc).isoformat(), "symbol": sym,
             "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
             "qty": qty, "exit_reason": "STOP_LOSS",
             "pnl_dollars": round(pd_, 2), "pnl_percent": round(pp_, 2),
@@ -97,7 +98,7 @@ def log_exits_from_broker():
             if ep is None: continue
             xp = float(o.filled_avg_price); q = int(o.filled_qty)
             peak = get_peak_since(o.symbol, et) if et else None
-            log_exit(o.symbol, ep, xp, q, peak)
+            log_exit(o.symbol, ep, xp, q, peak, exit_timestamp=ts)
     except Exception as e: L(f"⚠️ log exits: {e}")
 
 def update_trails():
