@@ -30,6 +30,7 @@ RISK_PER_TRADE = 0.02
 MAX_POSITIONS = 2
 TACTICAL_LIMIT_PCT = 0.10
 
+BOT_NAME = "v3_fixed"
 log = get_logger("v3_fixed", "v3_fixed_bot.log")
 def L(m): print(m); log.info(m)
 
@@ -57,11 +58,18 @@ def log_exits_from_broker():
             if o.side != OrderSide.SELL or not o.filled_at or not o.filled_avg_price: continue
             ts = o.filled_at.isoformat()
             if f"{o.symbol}_{ts}" in seen: continue
-            ep = None
+            entry_order = None
             for x in closed:
-                if x.symbol == o.symbol and x.side == OrderSide.BUY and x.filled_at and x.filled_avg_price:
-                    ep = float(x.filled_avg_price); break
-            if ep is None: continue
+                if (x.symbol == o.symbol and x.side == OrderSide.BUY
+                    and x.filled_at and x.filled_avg_price
+                    and x.filled_at <= o.filled_at):
+                    if entry_order is None or x.filled_at > entry_order.filled_at:
+                        entry_order = x
+            if entry_order is None: continue
+            cid = (getattr(entry_order, "client_order_id", "") or "")
+            if cid and not cid.startswith(BOT_NAME + "_"):
+                continue
+            ep = float(entry_order.filled_avg_price)
             xp = float(o.filled_avg_price); q = int(o.filled_qty)
             pd_ = (xp - ep) * q; pp_ = (xp - ep) / ep * 100
             fees = estimate_regulatory_fees(xp, q)
@@ -127,7 +135,8 @@ def try_entry():
                     symbol=sym, qty=qty, side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
                     take_profit=TakeProfitRequest(limit_price=target),
-                    stop_loss=StopLossRequest(stop_price=stop)))
+                    stop_loss=StopLossRequest(stop_price=stop,
+                    client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time()))))
                 L(f"  ✅ {sym} submitted")
                 log_entry(sym, qty, close, stop, target)
                 send_telegram(f"🚨 *v3_fixed*: {sym} {qty} @ ${close:.2f}\nSL ${stop} TP ${target}")
