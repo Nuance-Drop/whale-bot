@@ -39,10 +39,17 @@ client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
 def entry_info(sym):
     req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
+    latest = None
     for o in client.get_orders(filter=req):
         if o.symbol == sym and o.side == OrderSide.BUY and o.filled_at:
-            return float(o.filled_avg_price), o.filled_at
-    return None, None
+            cid = (getattr(o, "client_order_id", "") or "")
+            if cid and not cid.startswith(BOT_NAME + "_"):
+                continue
+            if latest is None or o.filled_at > latest.filled_at:
+                latest = o
+    if latest is None:
+        return None, None
+    return float(latest.filled_avg_price), latest.filled_at
 
 def all_open_stops(sym):
     req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
