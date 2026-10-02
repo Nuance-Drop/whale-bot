@@ -36,6 +36,24 @@ def L(m): print(m); log.info(m)
 
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
+def get_bot_positions():
+    all_pos = get_bot_positions()
+    bot_pos = []
+    req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
+    orders = client.get_orders(filter=req)
+    for p in all_pos:
+        entry = None
+        for o in orders:
+            if o.symbol == p.symbol and o.side == OrderSide.BUY and o.filled_at:
+                cid = (getattr(o, 'client_order_id', '') or '')
+                if cid.startswith(BOT_NAME + '_'):
+                    if entry is None or o.filled_at > entry.filled_at:
+                        entry = o
+        if entry:
+            bot_pos.append(p)
+    return bot_pos
+
+
 def log_entry(sym, qty, price, stop, target):
     try:
         if not SUPABASE_URL or not SUPABASE_KEY: return
@@ -94,7 +112,7 @@ def try_entry():
     if not is_market_bullish():
         L("regime below 200MA"); return "no_signal"
     a = client.get_account(); eq = float(a.equity)
-    pos = client.get_all_positions()
+    pos = get_bot_positions()
     held = [p.symbol for p in pos]
     if len(pos) >= MAX_POSITIONS: return "skipped"
     total = sum(float(p.market_value) for p in pos)
@@ -166,7 +184,7 @@ def run():
         status = try_entry()
         a = client.get_account()
         log_run("v3_fixed", status, equity=float(a.equity),
-                positions=len(client.get_all_positions()))
+                positions=len(get_bot_positions()))
     except Exception as e:
         L(f"entry: {e}"); log_run("v3_fixed", "error", error=str(e))
     L("="*60)
