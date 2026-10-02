@@ -66,7 +66,7 @@ analyzer = SentimentIntensityAnalyzer()
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
 def get_bot_positions():
-    all_pos = get_bot_positions()
+    all_pos = client.get_all_positions()
     bot_pos = []
     req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
     orders = client.get_orders(filter=req)
