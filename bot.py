@@ -65,6 +65,24 @@ W = load_weights()
 analyzer = SentimentIntensityAnalyzer()
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
+def get_bot_positions():
+    all_pos = get_bot_positions()
+    bot_pos = []
+    req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
+    orders = client.get_orders(filter=req)
+    for p in all_pos:
+        entry = None
+        for o in orders:
+            if o.symbol == p.symbol and o.side == OrderSide.BUY and o.filled_at:
+                cid = (getattr(o, 'client_order_id', '') or '')
+                if cid.startswith(BOT_NAME + '_'):
+                    if entry is None or o.filled_at > entry.filled_at:
+                        entry = o
+        if entry:
+            bot_pos.append(p)
+    return bot_pos
+
+
 KALSHI_URL = "https://external-api.kalshi.com/trade-api/v2"
 def kalshi_macro():
     try:
@@ -357,7 +375,7 @@ def run():
         L(f"❌ account: {e}"); log_run("v10", "error", error=str(e)); return
 
     L("--- positions ---")
-    pos = client.get_all_positions()
+    pos = get_bot_positions()
     held = {p.symbol for p in pos}
     for o in client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)):
         held.add(o.symbol)
