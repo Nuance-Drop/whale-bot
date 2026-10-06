@@ -266,7 +266,7 @@ def run():
 
     if should_halt("v3"):
         L("🛑 halted")
-        log_run("v3", "error", error="halted due to consecutive failures")
+        log_run("v3", "halted", error="halted due to consecutive failures")
         return
 
     if drawdown_check(client, 0.05, L):
