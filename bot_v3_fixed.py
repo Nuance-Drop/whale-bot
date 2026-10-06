@@ -171,7 +171,7 @@ def run():
         L("market closed"); log_run("v3_fixed", "market_closed"); return
 
     if should_halt("v3_fixed"):
-        L("🛑 halted"); log_run("v3_fixed", "error", error="halted"); return
+        L("🛑 halted"); log_run("v3_fixed", "halted", error="halted"); return
 
     if drawdown_check(client, 0.05, L):
         log_run("v3_fixed", "error", error="drawdown halt"); return
