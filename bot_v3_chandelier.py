@@ -270,7 +270,7 @@ def run():
         L("market closed"); log_run("v3_chandelier", "market_closed"); return
 
     if should_halt("v3_chandelier"):
-        L("🛑 halted"); log_run("v3_chandelier", "error", error="halted"); return
+        L("🛑 halted"); log_run("v3_chandelier", "halted", error="halted"); return
 
     if drawdown_check(client, 0.05, L):
         log_run("v3_chandelier", "error", error="drawdown halt"); return
