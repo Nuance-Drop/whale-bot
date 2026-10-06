@@ -359,7 +359,7 @@ def run():
 
     if should_halt("v10"):
         L("🛑 halted due to consecutive failures")
-        log_run("v10", "error", error="halted due to consecutive failures")
+        log_run("v10", "halted", error="halted due to consecutive failures")
         return
 
     L("--- drawdown ---")
