@@ -1,6 +1,6 @@
 """
 Shared utilities for all Whale Bots.
-Supabase-backed storage. Unlimited API calls, free forever.
+Supabase-backed storage, self-clearing halt logic.
 """
 
 import os, time, json, random, logging, requests
@@ -16,11 +16,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 GLOBAL_EXPOSURE_CAP_PCT = float(os.environ.get("GLOBAL_EXPOSURE_CAP_PCT", "0.30"))
 
-# ============================================================
-# SUPABASE CLIENT (lazy init)
-# ============================================================
 _sb_client = None
-
 def _sb():
     global _sb_client
     if _sb_client is None:
@@ -28,9 +24,6 @@ def _sb():
         _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _sb_client
 
-# ============================================================
-# LOGGER
-# ============================================================
 def get_logger(name, logfile):
     log = logging.getLogger(name)
     log.setLevel(logging.INFO)
@@ -40,9 +33,6 @@ def get_logger(name, logfile):
         log.addHandler(fh)
     return log
 
-# ============================================================
-# SAFE REQUEST
-# ============================================================
 def safe_request(fn, *args, max_retries=3, **kwargs):
     for i in range(max_retries):
         try:
@@ -63,9 +53,6 @@ def http_get(url, **kwargs):
 def http_post(url, **kwargs):
     return safe_request(requests.post, url, timeout=15, **kwargs)
 
-# ============================================================
-# TELEGRAM
-# ============================================================
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -77,9 +64,6 @@ def send_telegram(msg):
     except Exception:
         pass
 
-# ============================================================
-# SUPABASE — Runs
-# ============================================================
 def log_run(bot_name, status, equity=None, positions=0, threshold=None,
             top_candidate=None, top_score=None, action="", error=""):
     if status == "no_signal" and not error:
@@ -103,9 +87,6 @@ def log_run(bot_name, status, equity=None, positions=0, threshold=None,
     except Exception:
         pass
 
-# ============================================================
-# SUPABASE — Peak
-# ============================================================
 def get_peak_equity():
     try:
         if not SUPABASE_URL or not SUPABASE_KEY:
@@ -126,24 +107,56 @@ def set_peak_equity(value):
         pass
 
 # ============================================================
-# FAILURE CHECK
+# HALT LOGIC — FIXED
 # ============================================================
 def consecutive_failures(bot_name, lookback=3):
+    """Count consecutive 'error' statuses. Ignores 'halted' rows so the halt
+    does not self-perpetuate. Only counts errors within the last 24 hours."""
     try:
         if not SUPABASE_URL or not SUPABASE_KEY:
             return 0
-        r = _sb().table("runs").select("status").eq("bot", bot_name).order("timestamp", desc=True).limit(lookback).execute()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        r = (_sb().table("runs")
+             .select("status, timestamp")
+             .eq("bot", bot_name)
+             .gt("timestamp", cutoff)
+             .order("timestamp", desc=True)
+             .limit(lookback + 5)
+             .execute())
         count = 0
         for row in (r.data or []):
-            if row.get("status") == "error":
+            status = row.get("status")
+            if status == "halted":
+                continue
+            if status == "error":
                 count += 1
             else:
+                break
+            if count >= lookback:
                 break
         return count
     except Exception:
         return 0
 
 def should_halt(bot_name):
+    """Return True if the bot has 3 consecutive errors in the last 24 hours.
+    Only alerts once per streak — checks if the most recent row is already
+    a 'halted' row and stays quiet in that case."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            return False
+        # Check the most recent row — if it's already a halt, don't alert again
+        r = (_sb().table("runs")
+             .select("status")
+             .eq("bot", bot_name)
+             .order("timestamp", desc=True)
+             .limit(1)
+             .execute())
+        if r.data and r.data[0].get("status") == "halted":
+            return True
+    except Exception:
+        pass
+
     n = consecutive_failures(bot_name, lookback=3)
     if n >= 3:
         send_telegram(f"🛑 *{bot_name} HALTED* — {n} consecutive errors.")
@@ -151,7 +164,7 @@ def should_halt(bot_name):
     return False
 
 # ============================================================
-# MARKET UTILITIES
+# MARKET UTILITIES (unchanged)
 # ============================================================
 def is_market_open():
     now = datetime.now(timezone.utc)
@@ -253,9 +266,6 @@ def clean_for_json(obj):
         return [clean_for_json(x) for x in obj]
     return obj
 
-# ============================================================
-# GLOBAL EXPOSURE CAP
-# ============================================================
 def total_exposure(client):
     try:
         positions = client.get_all_positions()
@@ -281,9 +291,6 @@ def would_exceed_global_cap(client, new_position_value, log_fn=None):
             log_fn(f"  ⚠️ global cap check failed: {e}")
         return True, 0.0, 0.0, 0.0
 
-# ============================================================
-# CORRELATION CHECK
-# ============================================================
 def positions_correlation_risk(candidate_symbol, existing_symbols, threshold=0.7, log_fn=None):
     if not existing_symbols:
         return True, 0.0, None
@@ -319,9 +326,6 @@ def positions_correlation_risk(candidate_symbol, existing_symbols, threshold=0.7
             log_fn(f"  ⚠️ correlation check failed: {e}")
         return True, 0.0, None
 
-# ============================================================
-# REGULATORY FEES
-# ============================================================
 def estimate_regulatory_fees(exit_price, qty):
     proceeds = exit_price * qty
     sec_fee = proceeds * 0.0000278
@@ -329,9 +333,6 @@ def estimate_regulatory_fees(exit_price, qty):
     cat_fee = max(0.000114, 0.01)
     return round(sec_fee + finra_fee + cat_fee, 4)
 
-# ============================================================
-# PURE FUNCTIONS (unit-testable)
-# ============================================================
 def score_mult(score, threshold):
     gap = score - threshold
     if gap <= 0: return 0.5
