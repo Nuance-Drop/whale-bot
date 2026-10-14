@@ -102,11 +102,19 @@ def log_entry(sym, qty, price, stop, score):
 def log_exit(sym, entry, exit_price, qty, peak=None, exit_timestamp=None):
     try:
         if not SUPABASE_URL or not SUPABASE_KEY: return
+        
+        # FIX: Deduplication check before alerting
+        ts_str = (exit_timestamp or datetime.now(timezone.utc).isoformat()).replace(microsecond=0)
+        existing = _sb().table("exits").select("id").eq("symbol", sym).eq("exit_timestamp", ts_str).execute()
+        if existing.data and len(existing.data) > 0:
+            L(f"📕 {sym} exit already logged at {ts_str}, skipping")
+            return
+
         pd_ = (exit_price - entry) * qty
         pp_ = (exit_price - entry) / entry * 100
         fees = estimate_regulatory_fees(exit_price, qty)
         payload = {
-            "exit_timestamp": exit_timestamp or datetime.now(timezone.utc).isoformat(), "symbol": sym,
+            "exit_timestamp": ts_str, "symbol": sym,
             "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
             "qty": qty, "exit_reason": "STOP_LOSS",
             "pnl_dollars": round(pd_, 2), "pnl_percent": round(pp_, 2),
@@ -124,11 +132,17 @@ def log_exits_from_broker():
         if not SUPABASE_URL or not SUPABASE_KEY: return
         closed = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
         existing = _sb().table("exits").select("symbol, exit_timestamp").execute()
-        seen = {f"{r['symbol']}_{r['exit_timestamp']}" for r in (existing.data or [])}
+        
+        # FIX: Normalize timestamps to seconds
+        seen = {f"{r['symbol']}_{r['exit_timestamp'][:19]}" for r in (existing.data or [])}
+        
         for o in closed:
             if o.side != OrderSide.SELL or not o.filled_at or not o.filled_avg_price: continue
-            ts = o.filled_at.isoformat()
+            
+            # FIX: Normalize Alpaca timestamp
+            ts = o.filled_at.replace(microsecond=0).isoformat()
             if f"{o.symbol}_{ts}" in seen: continue
+            
             ep, et = entry_info(o.symbol)
             if ep is None: continue
             xp = float(o.filled_avg_price); q = int(o.filled_qty)
@@ -232,7 +246,10 @@ def try_entry():
                 L(f"  ⛔ global cap — skipping {sym}")
                 continue
 
-            existing_syms = [p.symbol for p in pos if p.symbol != sym]
+            # FIX: Fetch ALL open positions across ALL bots for correlation check
+            all_positions = client.get_all_positions()
+            existing_syms = [p.symbol for p in all_positions if p.symbol != sym]
+            
             corr_ok, worst_corr, corr_sym = positions_correlation_risk(sym, existing_syms, threshold=0.7, log_fn=L)
             if not corr_ok:
                 L(f"  ⛔ correlated with {corr_sym} ({worst_corr:+.2f}) — skipping {sym}")
