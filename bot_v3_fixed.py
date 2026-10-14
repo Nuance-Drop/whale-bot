@@ -71,11 +71,23 @@ def log_exits_from_broker():
         if not SUPABASE_URL or not SUPABASE_KEY: return
         closed = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
         existing = _sb().table("exits").select("symbol, exit_timestamp").execute()
-        seen = {f"{r['symbol']}_{r['exit_timestamp']}" for r in (existing.data or [])}
+        
+        # FIX: Normalize timestamps to seconds
+        seen = {f"{r['symbol']}_{r['exit_timestamp'][:19]}" for r in (existing.data or [])}
+        
         for o in closed:
             if o.side != OrderSide.SELL or not o.filled_at or not o.filled_avg_price: continue
-            ts = o.filled_at.isoformat()
+            
+            # FIX: Normalize Alpaca timestamp
+            ts = o.filled_at.replace(microsecond=0).isoformat()
             if f"{o.symbol}_{ts}" in seen: continue
+            
+            # FIX: Pre-check for duplicates before logging/alerting
+            existing_dup = _sb().table("exits").select("id").eq("symbol", o.symbol).eq("exit_timestamp", ts).execute()
+            if existing_dup.data and len(existing_dup.data) > 0:
+                L(f"📕 {o.symbol} exit already logged at {ts}, skipping")
+                continue
+
             entry_order = None
             for x in closed:
                 if (x.symbol == o.symbol and x.side == OrderSide.BUY
@@ -138,7 +150,10 @@ def try_entry():
                 L(f"  ⛔ global cap — skipping {sym}")
                 continue
 
-            existing_syms = [p.symbol for p in pos if p.symbol != sym]
+            # FIX: Fetch ALL open positions across ALL bots for correlation check
+            all_positions = client.get_all_positions()
+            existing_syms = [p.symbol for p in all_positions if p.symbol != sym]
+            
             corr_ok, worst_corr, corr_sym = positions_correlation_risk(sym, existing_syms, threshold=0.7, log_fn=L)
             if not corr_ok:
                 L(f"  ⛔ correlated with {corr_sym} ({worst_corr:+.2f}) — skipping {sym}")
@@ -157,7 +172,8 @@ def try_entry():
                     client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time()))))
                 L(f"  ✅ {sym} submitted")
                 log_entry(sym, qty, close, stop, target)
-                send_telegram(f"🚨 *v3_fixed*: {sym} {qty} @ ${close:.2f}\nSL ${stop} TP ${target}")
+                send_telegram(f"🚨 *v3_fixed*: {sym} {qty} @ ${close:.2f}
+SL ${stop} TP ${target}")
                 return "traded"
             except Exception as e:
                 L(f"  ❌ {sym}: {e}")
