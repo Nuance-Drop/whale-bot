@@ -363,7 +363,7 @@ def run():
         return
 
     L("--- drawdown ---")
-    if drawdown_check(client, 0.05, L):
+    if drawdown_check(client, 0.05, L, is_global_checker=True):
         log_run("v10", "error", error="drawdown halt"); return
 
     L("--- exits ---")
