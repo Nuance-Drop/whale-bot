@@ -179,7 +179,12 @@ def is_market_bullish():
     spy['SMA200'] = spy['Close'].rolling(200).mean()
     return bool(spy['Close'].iloc[-1] > spy['SMA200'].iloc[-1])
 
-def drawdown_check(client, threshold=0.05, log_fn=None):
+def drawdown_check(client, threshold=0.05, log_fn=None, is_global_checker=False):
+    """Account-wide drawdown check.
+    All bots halt if drawdown >= threshold.
+    Only the bot with is_global_checker=True (v10) fires the alert and closes
+    positions. Other bots halt silently to avoid duplicate alerts and duplicate
+    close_all_positions calls."""
     try:
         a = client.get_account()
         equity = float(a.equity)
@@ -191,10 +196,14 @@ def drawdown_check(client, threshold=0.05, log_fn=None):
         if log_fn:
             log_fn(f"drawdown {dd:.2%} (peak ${peak:.2f}, equity ${equity:.2f})")
         if dd >= threshold:
-            if log_fn:
-                log_fn(f"🛑 DRAWDOWN LIMIT ({dd:.2%})")
-            send_telegram(f"🛑 *DRAWDOWN HALT*: {dd:.2%}")
-            client.close_all_positions(cancel_orders=True)
+            if is_global_checker:
+                if log_fn:
+                    log_fn(f"🛑 DRAWDOWN LIMIT ({dd:.2%}) — global halt")
+                send_telegram(f"🛑 *GLOBAL DRAWDOWN HALT*: {dd:.2%}")
+                client.close_all_positions(cancel_orders=True)
+            else:
+                if log_fn:
+                    log_fn(f"🛑 DRAWDOWN LIMIT ({dd:.2%}) — halted (global halt owned by v10)")
             return True
         return False
     except Exception as e:
