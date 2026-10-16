@@ -263,8 +263,7 @@ def try_entry():
                 ))
                 L(f"  ✅ filled ${actual:.2f} stop ${real_stop}")
                 log_entry(sym, qty, actual, real_stop, 3)
-                send_telegram(f"🚨 *v3*: {sym} {qty} @ ${actual:.2f}
-Stop ${real_stop}")
+                send_telegram(f"🚨 *v3*: {sym} {qty} @ ${actual:.2f}\nStop ${real_stop}")
                 return "traded"
             except Exception as e:
                 L(f"  ❌ {sym}: {e}")
