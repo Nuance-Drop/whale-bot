@@ -172,8 +172,7 @@ def try_entry():
                     client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time()))))
                 L(f"  ✅ {sym} submitted")
                 log_entry(sym, qty, close, stop, target)
-                send_telegram(f"🚨 *v3_fixed*: {sym} {qty} @ ${close:.2f}
-SL ${stop} TP ${target}")
+                send_telegram(f"🚨 *v3_fixed*: {sym} {qty} @ ${close:.2f}\nSL ${stop} TP ${target}")
                 return "traded"
             except Exception as e:
                 L(f"  ❌ {sym}: {e}")
