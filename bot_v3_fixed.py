@@ -31,6 +31,7 @@ MAX_POSITIONS = 2
 TACTICAL_LIMIT_PCT = 0.10
 
 BOT_NAME = "v3_fixed"
+BOT_PREFIX = "v3fixed_"
 log = get_logger("v3_fixed", "v3_fixed_bot.log")
 def L(m): print(m); log.info(m)
 
@@ -46,7 +47,7 @@ def get_bot_positions():
         for o in orders:
             if o.symbol == p.symbol and o.side == OrderSide.BUY and o.filled_at:
                 cid = (getattr(o, 'client_order_id', '') or '')
-                if cid.startswith(BOT_NAME + '_'):
+                if cid.startswith(BOT_PREFIX):
                     if entry is None or o.filled_at > entry.filled_at:
                         entry = o
         if entry:
@@ -97,7 +98,7 @@ def log_exits_from_broker():
                         entry_order = x
             if entry_order is None: continue
             cid = (getattr(entry_order, "client_order_id", "") or "")
-            if cid and not cid.startswith(BOT_NAME + "_"):
+            if cid and not cid.startswith(BOT_PREFIX):
                 continue
             ep = float(entry_order.filled_avg_price)
             xp = float(o.filled_avg_price); q = int(o.filled_qty)
@@ -169,7 +170,7 @@ def try_entry():
                     time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
                     take_profit=TakeProfitRequest(limit_price=target),
                     stop_loss=StopLossRequest(stop_price=stop),
-                    client_order_id=BOT_NAME + "_" + sym + "_" + str(int(time.time()))))
+                    client_order_id=BOT_PREFIX + sym + "_" + str(int(time.time()))))
                 L(f"  ✅ {sym} submitted")
                 log_entry(sym, qty, close, stop, target)
                 send_telegram(f"🚨 *v3_fixed*: {sym} {qty} @ ${close:.2f}\nSL ${stop} TP ${target}")
