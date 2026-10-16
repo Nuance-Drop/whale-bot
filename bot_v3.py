@@ -32,6 +32,7 @@ MAX_POSITIONS = 2
 TACTICAL_LIMIT_PCT = 0.10
 
 BOT_NAME = "v3"
+BOT_PREFIX = "v3bot_"
 log = get_logger("v3", "v3_bot.log")
 def L(m): print(m); log.info(m)
 
@@ -47,7 +48,7 @@ def get_bot_positions():
         for o in orders:
             if o.symbol == p.symbol and o.side == OrderSide.BUY and o.filled_at:
                 cid = (getattr(o, 'client_order_id', '') or '')
-                if cid.startswith(BOT_NAME + '_'):
+                if cid.startswith(BOT_PREFIX):
                     if entry is None or o.filled_at > entry.filled_at:
                         entry = o
         if entry:
@@ -61,7 +62,7 @@ def entry_info(sym):
     for o in client.get_orders(filter=req):
         if o.symbol == sym and o.side == OrderSide.BUY and o.filled_at:
             cid = (getattr(o, "client_order_id", "") or "")
-            if cid and not cid.startswith(BOT_NAME + "_"):
+            if cid and not cid.startswith(BOT_PREFIX):
                 continue
             if latest is None or o.filled_at > latest.filled_at:
                 latest = o
@@ -247,7 +248,8 @@ def try_entry():
             try:
                 order = client.submit_order(MarketOrderRequest(
                     symbol=sym, qty=qty, side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
+                    client_order_id=BOT_PREFIX + sym + "_" + str(int(time.time()))
                 ))
                 actual = close
                 for _ in range(15):
